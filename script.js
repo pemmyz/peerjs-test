@@ -23,6 +23,27 @@ const HEARTBEAT_TIMEOUT = 30000;
 const RECONNECT_BASE_DELAY = 2000;
 const RECONNECT_MAX_DELAY = 15000;
 
+// ICE Servers (STUN + TURN)
+// IMPORTANT: Passing `config.iceServers` to PeerJS replaces its defaults.
+// Keep STUN servers here, and uncomment + fill in your TURN server(s)
+// (e.g. from Metered.ca or Cloudflare Realtime TURN) for internet connections.
+const ICE_SERVERS = [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun.cloudflare.com:3478" }
+
+    // Example TURN entries (uncomment and replace with your credentials):
+    // ,{
+    //     urls: "turn:your-turn-host.example.com:80",
+    //     username: "YOUR_USERNAME",
+    //     credential: "YOUR_CREDENTIAL"
+    // },
+    // {
+    //     urls: "turns:your-turn-host.example.com:443?transport=tcp",
+    //     username: "YOUR_USERNAME",
+    //     credential: "YOUR_CREDENTIAL"
+    // }
+];
+
 // QR Code instance
 let qrCodeInstance = null;
 
@@ -34,6 +55,7 @@ const autoJoinId = urlParams.get("join");
 let peer;
 let connection = null;
 let remotePeerId = null;
+let hasConnectedOnce = false;
 
 // Reconnection state
 let reconnectAttempts = 0;
@@ -74,9 +96,23 @@ function getBaseUrl() {
 function initializePeer() {
     destroyed = false;
 
+    const hasTurnServer = ICE_SERVERS.some(server => {
+        const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
+        return urls.some(u => typeof u === "string" && (u.startsWith("turn:") || u.startsWith("turns:")));
+    });
+
+    if (!hasTurnServer) {
+        console.warn("No TURN server configured in ICE_SERVERS. Connections across different networks/mobile data may hang at ICE negotiation.");
+    }
+
     setStatus("Connecting to PeerJS Cloud...");
 
-    peer = new Peer();
+    peer = new Peer({
+        debug: 3, // Logs ICE candidates, SDP offers/answers, and PeerJS errors
+        config: {
+            iceServers: ICE_SERVERS
+        }
+    });
 
     peer.on("open", id => {
         console.log("PeerJS connected:", id);
@@ -107,24 +143,17 @@ function initializePeer() {
     peer.on("connection", conn => {
         console.log("Incoming connection:", conn.peer);
 
-        if (
-            connection &&
-            connection.open &&
-            connection.peer === conn.peer
-        ) {
-            conn.close();
-            return;
-        }
-
         if (connection && connection.open) {
+            if (connection.peer === conn.peer) {
+                conn.close();
+                return;
+            }
             console.log("Already connected to another player");
             conn.close();
             return;
         }
 
         remotePeerId = conn.peer;
-        updateReconnectLeader();
-
         setupConnection(conn);
     });
 
@@ -139,6 +168,9 @@ function initializePeer() {
         setStatus("PeerJS error: " + error.type);
 
         if (error.type === "peer-unavailable") {
+            if (connection && !connection.open) {
+                connection = null;
+            }
             scheduleReconnect();
         }
 
@@ -235,8 +267,6 @@ function connectToPlayer(id) {
     remotePeerId = id;
     reconnectAttempts = 0;
 
-    updateReconnectLeader();
-
     setStatus("Connecting to player...");
 
     const conn = peer.connect(id, {
@@ -252,12 +282,17 @@ function connectToPlayer(id) {
 
 function setupConnection(conn) {
     if (connection && connection.open) {
-        if (connection.peer === conn.peer) {
-            conn.close();
-            return;
-        }
         conn.close();
         return;
+    }
+
+    // Close any stale half-open previous connection before replacing it
+    if (connection && connection !== conn && !connection.open) {
+        try {
+            connection.close();
+        } catch (e) {
+            console.warn("Failed closing stale connection:", e);
+        }
     }
 
     connection = conn;
@@ -267,9 +302,32 @@ function setupConnection(conn) {
 
     console.log("Setting up connection:", conn.peer);
 
+    conn.on("iceStateChanged", state => {
+        console.log("ICE state:", state);
+
+        if (!conn.open) {
+            setStatus(`Connecting (ICE: ${state})...`);
+        }
+
+        if (state === "failed" && !conn.open) {
+            console.warn("ICE negotiation failed before DataConnection opened");
+            if (connection === conn) {
+                connection = null;
+            }
+            try {
+                conn.close();
+            } catch (e) {
+                // ignore
+            }
+            setStatus("P2P connection failed (NAT/firewall). Retrying...");
+            scheduleReconnect();
+        }
+    });
+
     conn.on("open", () => {
         console.log("P2P connection established");
 
+        hasConnectedOnce = true;
         reconnectAttempts = 0;
         lastPong = Date.now();
 
@@ -333,6 +391,11 @@ function setupConnection(conn) {
 
     conn.on("error", error => {
         console.error("DataConnection error:", error);
+
+        if (connection === conn && !conn.open) {
+            connection = null;
+        }
+
         setStatus("Connection error");
         scheduleReconnect();
     });
@@ -381,7 +444,10 @@ function stopHeartbeat() {
 function scheduleReconnect() {
     if (destroyed) return;
     if (!remotePeerId) return;
-    if (!isReconnectLeader) return;
+
+    // Only enforce reconnect leadership after both peers have connected once
+    // and know each other's Peer ID.
+    if (hasConnectedOnce && !isReconnectLeader) return;
     if (reconnectTimer) return;
 
     if (connection && connection.open) return;
