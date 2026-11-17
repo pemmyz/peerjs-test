@@ -1,4 +1,3 @@
-
 body {
     background: #151922;
     color: white;
@@ -36,11 +35,19 @@ button {
     border: 0;
     border-radius: 5px;
     cursor: pointer;
-    margin: 5px 0;
+    margin: 5px 4px 5px 0;
 }
 
 button:hover {
     background: #245db5;
+}
+
+.secondary-btn {
+    background: #444d5d;
+}
+
+.secondary-btn:hover {
+    background: #566175;
 }
 
 #messages {
@@ -54,3 +61,50 @@ code {
     overflow-wrap: anywhere;
 }
 
+/* Modal styles for QR Code */
+.modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.75);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 1000;
+}
+
+.modal.hidden {
+    display: none;
+}
+
+.modal-content {
+    background: #222936;
+    padding: 24px;
+    border-radius: 12px;
+    text-align: center;
+    max-width: 90vw;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+}
+
+#qrcode-container {
+    display: flex;
+    justify-content: center;
+    margin: 16px 0;
+}
+
+/* White background and padding is essential for QR scanners on dark mode */
+#qrcode {
+    background: #ffffff;
+    padding: 16px;
+    border-radius: 8px;
+    display: inline-block;
+}
+
+#qr-url-text {
+    font-size: 12px;
+    color: #aab2c0;
+    word-break: break-all;
+    margin-bottom: 16px;
+}

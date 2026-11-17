@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="fi">
 <head>
@@ -9,6 +8,8 @@
 
     <!-- PeerJS client -->
     <script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script>
+    <!-- QRCode generator library -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 </head>
 <body>
     <main>
@@ -19,7 +20,9 @@
         <section>
             <h2>Your Peer ID</h2>
             <code id="my-id">Connecting...</code>
+            <br><br>
             <button id="copy-id">Copy ID</button>
+            <button id="show-qr">Show QR Code</button>
         </section>
 
         <section>
@@ -36,7 +39,19 @@
         </section>
     </main>
 
+    <!-- QR Code Modal Dialog -->
+    <div id="qr-modal" class="modal hidden">
+        <div class="modal-content">
+            <h3>Scan to Connect</h3>
+            <p>Scan with another device on the same Wi-Fi network:</p>
+            <div id="qrcode-container">
+                <div id="qrcode"></div>
+            </div>
+            <p id="qr-url-text"></p>
+            <button id="close-qr" class="secondary-btn">Close</button>
+        </div>
+    </div>
+
     <script src="script.js"></script>
 </body>
 </html>
-
