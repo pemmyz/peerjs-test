@@ -1,0 +1,42 @@
+
+<!DOCTYPE html>
+<html lang="fi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>PeerJS P2P Test</title>
+    <link rel="stylesheet" href="style.css">
+
+    <!-- PeerJS client -->
+    <script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script>
+</head>
+<body>
+    <main>
+        <h1>PeerJS P2P Test</h1>
+
+        <p id="status">Connecting to PeerJS Cloud...</p>
+
+        <section>
+            <h2>Your Peer ID</h2>
+            <code id="my-id">Connecting...</code>
+            <button id="copy-id">Copy ID</button>
+        </section>
+
+        <section>
+            <h2>Join another player</h2>
+            <input id="remote-id" placeholder="Enter player's ID">
+            <button id="connect">Connect</button>
+        </section>
+
+        <section>
+            <h2>Chat</h2>
+            <div id="messages"></div>
+            <input id="message" placeholder="Write a message...">
+            <button id="send">Send</button>
+        </section>
+    </main>
+
+    <script src="script.js"></script>
+</body>
+</html>
+
