@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>PeerJS P2P Test</title>
-    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="style.css?v=3">
 
     <!-- PeerJS client -->
     <script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script>
@@ -16,6 +16,17 @@
         <h1>PeerJS P2P Test</h1>
 
         <p id="status">Connecting to PeerJS Cloud...</p>
+
+        <div class="ping-bar">
+            <div class="ping-item">
+                <span class="ping-label">Player Ping (P2P):</span>
+                <code id="player-ping" class="ping-value">-- ms</code>
+            </div>
+            <div class="ping-item">
+                <span class="ping-label">Server Ping (PeerJS):</span>
+                <code id="server-ping" class="ping-value">-- ms</code>
+            </div>
+        </div>
 
         <section>
             <h2>Your Peer ID</h2>
@@ -43,7 +54,7 @@
     <div id="qr-modal" class="modal hidden">
         <div class="modal-content">
             <h3>Scan to Connect</h3>
-            <p>Scan with another device on the same Wi-Fi network:</p>
+            <p>Scan with another device to connect:</p>
             <div id="qrcode-container">
                 <div id="qrcode"></div>
             </div>
@@ -52,6 +63,6 @@
         </div>
     </div>
 
-    <script src="script.js"></script>
+    <script src="script.js?v=3"></script>
 </body>
 </html>

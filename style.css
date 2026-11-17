@@ -61,6 +61,48 @@ code {
     overflow-wrap: anywhere;
 }
 
+/* Ping status bar */
+.ping-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    background: #222936;
+    padding: 12px 16px;
+    border-radius: 10px;
+    margin: 12px 0;
+}
+
+.ping-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1 1 200px;
+}
+
+.ping-label {
+    color: #aab2c0;
+    font-size: 14px;
+}
+
+.ping-value {
+    background: #151922;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-weight: bold;
+}
+
+.ping-good {
+    color: #4caf50;
+}
+
+.ping-medium {
+    color: #ff9800;
+}
+
+.ping-bad {
+    color: #f44336;
+}
+
 /* Modal styles for QR Code */
 .modal {
     position: fixed;

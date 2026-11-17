@@ -1,6 +1,6 @@
 // ==========================================
 // PeerJS P2P Chat
-// Automatic reconnection + Heartbeat + Dynamic QR Connect
+// Automatic reconnection + Heartbeat + Ping + Dynamic QR Connect
 // ==========================================
 
 // DOM elements
@@ -9,6 +9,8 @@ const myId = document.getElementById("my-id");
 const remoteId = document.getElementById("remote-id");
 const messages = document.getElementById("messages");
 const messageInput = document.getElementById("message");
+const playerPingEl = document.getElementById("player-ping");
+const serverPingEl = document.getElementById("server-ping");
 
 // QR Modal DOM elements
 const qrModal = document.getElementById("qr-modal");
@@ -18,8 +20,9 @@ const qrcodeElement = document.getElementById("qrcode");
 const qrUrlText = document.getElementById("qr-url-text");
 
 // Configuration
-const HEARTBEAT_INTERVAL = 5000;
+const HEARTBEAT_INTERVAL = 3000;
 const HEARTBEAT_TIMEOUT = 30000;
+const SERVER_PING_INTERVAL = 10000;
 const RECONNECT_BASE_DELAY = 2000;
 const RECONNECT_MAX_DELAY = 15000;
 
@@ -64,12 +67,13 @@ let signalingRetryTimer = null;
 let isReconnectLeader = false;
 let destroyed = false;
 
-// Heartbeat state
+// Heartbeat & Ping state
 let heartbeatTimer = null;
+let serverPingTimer = null;
 let lastPong = Date.now();
 
 // ==========================================
-// UI & URL HELPERS
+// UI, PING & URL HELPERS
 // ==========================================
 
 function setStatus(text) {
@@ -84,9 +88,83 @@ function addMessage(sender, message) {
     messages.scrollTop = messages.scrollHeight;
 }
 
+function updatePingUI(element, ms) {
+    if (!element) return;
+
+    element.classList.remove("ping-good", "ping-medium", "ping-bad");
+
+    if (typeof ms !== "number" || Number.isNaN(ms)) {
+        element.textContent = "-- ms";
+        return;
+    }
+
+    element.textContent = `${ms} ms`;
+
+    if (ms < 80) {
+        element.classList.add("ping-good");
+    } else if (ms <= 180) {
+        element.classList.add("ping-medium");
+    } else {
+        element.classList.add("ping-bad");
+    }
+}
+
 // Dynamically resolves to current origin + path (e.g., GitHub Pages subpath or local IP)
 function getBaseUrl() {
     return `${window.location.origin}${window.location.pathname}`;
+}
+
+function getSignalingHttpUrl() {
+    const opts = (peer && peer.options) || {};
+    const protocol = opts.secure === false ? "http" : "https";
+    const host = opts.host || "0.peerjs.com";
+    const port = opts.port ? `:${opts.port}` : "";
+    const path = opts.path || "/";
+    return `${protocol}://${host}${port}${path}`;
+}
+
+// ==========================================
+// SERVER PING (PEERJS SIGNALING SERVER)
+// ==========================================
+
+async function measureServerPing() {
+    if (destroyed) return;
+
+    const url = `${getSignalingHttpUrl()}?_=${Date.now()}`;
+    const start = performance.now();
+
+    try {
+        const response = await fetch(url, {
+            method: "GET",
+            cache: "no-store"
+        });
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+
+        const rtt = Math.max(0, Math.round(performance.now() - start));
+        updatePingUI(serverPingEl, rtt);
+    } catch (error) {
+        console.warn("Server ping failed:", error);
+        updatePingUI(serverPingEl, null);
+    }
+}
+
+function startServerPing() {
+    stopServerPing();
+    measureServerPing();
+
+    serverPingTimer = setInterval(() => {
+        measureServerPing();
+    }, SERVER_PING_INTERVAL);
+}
+
+function stopServerPing() {
+    if (serverPingTimer) {
+        clearInterval(serverPingTimer);
+        serverPingTimer = null;
+    }
 }
 
 // ==========================================
@@ -119,6 +197,8 @@ function initializePeer() {
 
         myId.textContent = id;
         setStatus("Connected to PeerJS Cloud");
+
+        startServerPing();
 
         // Update reconnect leadership
         if (remotePeerId) {
@@ -160,6 +240,7 @@ function initializePeer() {
     peer.on("disconnected", () => {
         console.warn("PeerJS Cloud disconnected");
         setStatus("Lost PeerJS Cloud connection...");
+        updatePingUI(serverPingEl, null);
         retrySignaling();
     });
 
@@ -175,12 +256,15 @@ function initializePeer() {
         }
 
         if (error.type === "network") {
+            updatePingUI(serverPingEl, null);
             retrySignaling();
         }
     });
 
     peer.on("close", () => {
         console.log("PeerJS instance closed");
+        stopServerPing();
+        updatePingUI(serverPingEl, null);
     });
 }
 
@@ -210,6 +294,8 @@ function retrySignaling() {
 window.addEventListener("online", () => {
     console.log("Internet connection restored");
 
+    measureServerPing();
+
     if (peer && peer.disconnected) {
         retrySignaling();
     }
@@ -222,6 +308,8 @@ window.addEventListener("online", () => {
 window.addEventListener("offline", () => {
     console.warn("Internet connection lost");
     setStatus("Internet disconnected...");
+    updatePingUI(serverPingEl, null);
+    updatePingUI(playerPingEl, null);
 });
 
 // ==========================================
@@ -314,6 +402,7 @@ function setupConnection(conn) {
             if (connection === conn) {
                 connection = null;
             }
+            updatePingUI(playerPingEl, null);
             try {
                 conn.close();
             } catch (e) {
@@ -349,14 +438,21 @@ function setupConnection(conn) {
     conn.on("data", data => {
         if (!data || typeof data !== "object") return;
 
-        // Heartbeat
+        // Heartbeat & P2P Ping
         if (data.type === "ping") {
-            conn.send({ type: "pong" });
+            conn.send({
+                type: "pong",
+                sentAt: data.sentAt
+            });
             return;
         }
 
         if (data.type === "pong") {
             lastPong = Date.now();
+            if (typeof data.sentAt === "number") {
+                const rtt = Math.max(0, Math.round(performance.now() - data.sentAt));
+                updatePingUI(playerPingEl, rtt);
+            }
             return;
         }
 
@@ -378,6 +474,7 @@ function setupConnection(conn) {
         console.warn("P2P connection closed");
 
         stopHeartbeat();
+        updatePingUI(playerPingEl, null);
 
         if (connection === conn) {
             connection = null;
@@ -394,6 +491,7 @@ function setupConnection(conn) {
 
         if (connection === conn && !conn.open) {
             connection = null;
+            updatePingUI(playerPingEl, null);
         }
 
         setStatus("Connection error");
@@ -402,32 +500,38 @@ function setupConnection(conn) {
 }
 
 // ==========================================
-// HEARTBEAT
+// HEARTBEAT & P2P PING
 // ==========================================
+
+function sendPlayerPing() {
+    if (!connection || !connection.open) return;
+
+    const elapsed = Date.now() - lastPong;
+
+    if (elapsed > HEARTBEAT_TIMEOUT) {
+        console.warn("Heartbeat timeout");
+        setStatus("Player not responding...");
+        updatePingUI(playerPingEl, null);
+        connection.close();
+        return;
+    }
+
+    connection.send({
+        type: "ping",
+        sentAt: performance.now(),
+        timestamp: Date.now()
+    });
+}
 
 function startHeartbeat() {
     stopHeartbeat();
 
     lastPong = Date.now();
 
-    heartbeatTimer = setInterval(() => {
-        if (!connection || !connection.open) return;
+    // Send one immediately so P2P ping appears right away
+    sendPlayerPing();
 
-        const elapsed = Date.now() - lastPong;
-
-        if (elapsed > HEARTBEAT_TIMEOUT) {
-            console.warn("Heartbeat timeout");
-            setStatus("Player not responding...");
-            connection.close();
-            return;
-        }
-
-        connection.send({
-            type: "ping",
-            timestamp: Date.now()
-        });
-
-    }, HEARTBEAT_INTERVAL);
+    heartbeatTimer = setInterval(sendPlayerPing, HEARTBEAT_INTERVAL);
 }
 
 function stopHeartbeat() {
@@ -597,6 +701,7 @@ window.addEventListener("beforeunload", () => {
     destroyed = true;
 
     stopHeartbeat();
+    stopServerPing();
 
     if (reconnectTimer) {
         clearTimeout(reconnectTimer);
