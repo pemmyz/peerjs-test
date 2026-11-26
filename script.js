@@ -1,14 +1,19 @@
 // ==========================================
-// PeerJS P2P Chat
-// Automatic reconnection + Heartbeat + Ping + Dynamic QR Connect
+// PeerJS Multi-User P2P Chat Room
+// Mesh discovery + Custom nicknames + Buffered delivery queue + Heartbeat + QR Connect
 // ==========================================
 
 // DOM elements
 const status = document.getElementById("status");
 const myId = document.getElementById("my-id");
 const remoteId = document.getElementById("remote-id");
+const usernameInput = document.getElementById("username");
+const saveUsernameBtn = document.getElementById("save-username");
+const userListEl = document.getElementById("user-list");
+const userCountEl = document.getElementById("user-count");
 const messages = document.getElementById("messages");
 const messageInput = document.getElementById("message");
+const queueStatusEl = document.getElementById("queue-status");
 const playerPingEl = document.getElementById("player-ping");
 const serverPingEl = document.getElementById("server-ping");
 
@@ -25,6 +30,7 @@ const HEARTBEAT_TIMEOUT = 30000;
 const SERVER_PING_INTERVAL = 10000;
 const RECONNECT_BASE_DELAY = 2000;
 const RECONNECT_MAX_DELAY = 15000;
+const USERNAME_STORAGE_KEY = "peerjs_chat_username";
 
 // ICE Servers (STUN + TURN)
 // IMPORTANT: Passing `config.iceServers` to PeerJS replaces its defaults.
@@ -56,21 +62,30 @@ const autoJoinId = urlParams.get("join");
 
 // PeerJS state
 let peer;
-let connection = null;
-let remotePeerId = null;
-let hasConnectedOnce = false;
+let defaultUsername = "User";
+
+// Multi-user mesh state: Map<peerId, PeerEntry>
+const peers = new Map();
 
 // Reconnection state
-let reconnectAttempts = 0;
-let reconnectTimer = null;
 let signalingRetryTimer = null;
-let isReconnectLeader = false;
 let destroyed = false;
 
 // Heartbeat & Ping state
 let heartbeatTimer = null;
 let serverPingTimer = null;
-let lastPong = Date.now();
+
+// Message buffering & deduplication state
+let messageCounter = 0;
+const globalPendingQueue = []; // Buffered when 0 peers are in the room
+const seenMessageIds = new Set(); // Deduplicates incoming messages across reconnects
+const sentMessages = new Map(); // msgId -> { totalRecipients: Set, ackedRecipients: Set, statusEl }
+
+// Restore per-tab/per-browser nickname if previously set
+const savedUsername = sessionStorage.getItem(USERNAME_STORAGE_KEY);
+if (savedUsername) {
+    usernameInput.value = savedUsername;
+}
 
 // ==========================================
 // UI, PING & URL HELPERS
@@ -80,12 +95,150 @@ function setStatus(text) {
     status.textContent = text;
 }
 
-function addMessage(sender, message) {
-    const item = document.createElement("p");
-    item.textContent = `${sender}: ${message}`;
-    messages.appendChild(item);
+function sanitizeUsername(name, fallbackId = "") {
+    if (typeof name === "string") {
+        const trimmed = name.trim().slice(0, 24);
+        if (trimmed) return trimmed;
+    }
+    return fallbackId ? `User-${fallbackId.slice(0, 4)}` : defaultUsername;
+}
 
+function getUsername() {
+    return sanitizeUsername(usernameInput.value, peer && peer.id ? peer.id : "");
+}
+
+function formatTime(ts) {
+    return new Date(ts || Date.now()).toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit"
+    });
+}
+
+function addMessage(sender, message, options = {}) {
+    const item = document.createElement("p");
+    item.className = "msg-row";
+
+    const timeSpan = document.createElement("span");
+    timeSpan.className = "msg-time";
+    timeSpan.textContent = `[${formatTime(options.timestamp)}]`;
+
+    const textSpan = document.createElement("span");
+    textSpan.textContent = `${sender}: ${message}`;
+
+    item.appendChild(timeSpan);
+    item.appendChild(textSpan);
+
+    let statusSpan = null;
+    if (options.isSelf) {
+        statusSpan = document.createElement("span");
+        statusSpan.className = "msg-status queued";
+        statusSpan.textContent = options.initialStatus || "[Queued]";
+        item.appendChild(statusSpan);
+    }
+
+    messages.appendChild(item);
     messages.scrollTop = messages.scrollHeight;
+    return statusSpan;
+}
+
+function addSystemMessage(text) {
+    addMessage("SYSTEM", text);
+}
+
+function renderUserList() {
+    if (!userListEl) return;
+
+    userListEl.innerHTML = "";
+
+    // Local user row
+    const selfLi = document.createElement("li");
+    selfLi.className = "user-item";
+    selfLi.innerHTML = `<div><strong>${escapeHtml(getUsername())}</strong> <span class="user-meta">(You${peer && peer.id ? ` · ${escapeHtml(peer.id.slice(0, 8))}…` : ""})</span></div><span class="user-status connected">Online</span>`;
+    userListEl.appendChild(selfLi);
+
+    let activeCount = 1;
+    for (const entry of peers.values()) {
+        if (entry.left) continue;
+
+        const isOpen = Boolean(entry.conn && entry.conn.open);
+        if (isOpen) activeCount++;
+
+        const li = document.createElement("li");
+        li.className = "user-item";
+
+        const pingText = isOpen && typeof entry.rtt === "number" ? ` · ${entry.rtt} ms` : "";
+        const queueText = entry.outbox.length > 0 ? ` · ${entry.outbox.length} queued` : "";
+
+        li.innerHTML = `
+            <div>
+                <strong>${escapeHtml(entry.username)}</strong>
+                <span class="user-meta">(${escapeHtml(entry.id.slice(0, 8))}…${pingText}${queueText})</span>
+            </div>
+            <span class="user-status ${isOpen ? "connected" : "reconnecting"}">
+                ${isOpen ? "Connected" : "Reconnecting"}
+            </span>
+        `;
+        userListEl.appendChild(li);
+    }
+
+    if (userCountEl) {
+        userCountEl.textContent = String(activeCount);
+    }
+}
+
+function escapeHtml(str) {
+    return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+}
+
+function updateAggregatedPing() {
+    const rtts = [];
+    for (const entry of peers.values()) {
+        if (entry.conn && entry.conn.open && typeof entry.rtt === "number") {
+            rtts.push(entry.rtt);
+        }
+    }
+
+    if (rtts.length === 0) {
+        updatePingUI(playerPingEl, null);
+        return;
+    }
+
+    const avg = Math.round(rtts.reduce((a, b) => a + b, 0) / rtts.length);
+    updatePingUI(playerPingEl, avg);
+}
+
+function updateRoomStatus() {
+    const openCount = Array.from(peers.values()).filter(e => e.conn && e.conn.open).length;
+    if (openCount > 0) {
+        setStatus(`Connected to ${openCount} user${openCount === 1 ? "" : "s"} in room`);
+    } else if (peers.size > 0) {
+        setStatus("Room disconnected. Reconnecting...");
+    } else if (peer && peer.id && !peer.disconnected) {
+        setStatus("Connected to PeerJS Cloud (waiting for users)");
+    }
+}
+
+function updateQueueStatusUI() {
+    if (!queueStatusEl) return;
+
+    const pendingIds = new Set(globalPendingQueue.map(m => m.id));
+    for (const entry of peers.values()) {
+        for (const item of entry.outbox) {
+            pendingIds.add(item.id);
+        }
+    }
+
+    if (pendingIds.size > 0) {
+        queueStatusEl.textContent = `Buffered messages waiting for delivery: ${pendingIds.size}`;
+    } else if (sentMessages.size > 0) {
+        queueStatusEl.textContent = "All sent messages delivered.";
+    } else {
+        queueStatusEl.textContent = "";
+    }
 }
 
 function updatePingUI(element, ms) {
@@ -196,26 +349,29 @@ function initializePeer() {
         console.log("PeerJS connected:", id);
 
         myId.textContent = id;
+        defaultUsername = `User-${id.slice(0, 4)}`;
+        if (!usernameInput.value.trim()) {
+            usernameInput.placeholder = `Nickname (default: ${defaultUsername})`;
+        }
+
         setStatus("Connected to PeerJS Cloud");
+        renderUserList();
 
         startServerPing();
 
-        // Update reconnect leadership
-        if (remotePeerId) {
-            updateReconnectLeader();
-        }
-
         // AUTO-CONNECT: If page was opened from QR scan or with ?join=...
-        if (autoJoinId && autoJoinId !== id && !connection) {
+        if (autoJoinId && autoJoinId !== id && !peers.has(autoJoinId)) {
             console.log("Auto-connecting to scanned peer:", autoJoinId);
             remoteId.value = autoJoinId;
             connectToPlayer(autoJoinId);
             return;
         }
 
-        // If signaling recovered but P2P is down
-        if (!connection && remotePeerId) {
-            scheduleReconnect();
+        // If signaling recovered and any peer P2P links are down
+        for (const entry of peers.values()) {
+            if ((!entry.conn || !entry.conn.open) && !entry.left) {
+                scheduleReconnect(entry.id);
+            }
         }
     });
 
@@ -223,17 +379,25 @@ function initializePeer() {
     peer.on("connection", conn => {
         console.log("Incoming connection:", conn.peer);
 
-        if (connection && connection.open) {
-            if (connection.peer === conn.peer) {
-                conn.close();
-                return;
-            }
-            console.log("Already connected to another player");
+        const existing = peers.get(conn.peer);
+        if (existing && existing.conn && existing.conn.open) {
             conn.close();
             return;
         }
 
-        remotePeerId = conn.peer;
+        // Glare resolution if both sides dialed simultaneously
+        if (existing && existing.conn && existing.conn !== conn && !existing.conn.open) {
+            if (peer.id < conn.peer) {
+                conn.close();
+                return;
+            }
+            try {
+                existing.conn.close();
+            } catch (e) {
+                // ignore
+            }
+        }
+
         setupConnection(conn);
     });
 
@@ -249,10 +413,20 @@ function initializePeer() {
         setStatus("PeerJS error: " + error.type);
 
         if (error.type === "peer-unavailable") {
-            if (connection && !connection.open) {
-                connection = null;
+            const match = error.message && error.message.match(/peer\s+([^\s]+)/i);
+            const unavailableId = match ? match[1] : null;
+
+            if (unavailableId && peers.has(unavailableId)) {
+                const entry = peers.get(unavailableId);
+                if (entry.conn && !entry.conn.open) {
+                    entry.conn = null;
+                    entry.rtt = null;
+                }
+                if (!entry.left) {
+                    scheduleReconnect(unavailableId);
+                }
+                renderUserList();
             }
-            scheduleReconnect();
         }
 
         if (error.type === "network") {
@@ -300,8 +474,10 @@ window.addEventListener("online", () => {
         retrySignaling();
     }
 
-    if (!connection && remotePeerId) {
-        scheduleReconnect();
+    for (const entry of peers.values()) {
+        if ((!entry.conn || !entry.conn.open) && !entry.left) {
+            scheduleReconnect(entry.id);
+        }
     }
 });
 
@@ -310,29 +486,97 @@ window.addEventListener("offline", () => {
     setStatus("Internet disconnected...");
     updatePingUI(serverPingEl, null);
     updatePingUI(playerPingEl, null);
+    renderUserList();
 });
 
 // ==========================================
-// RECONNECT LEADER
+// MESH PEER REGISTRY & HELPERS
 // ==========================================
 
-function updateReconnectLeader() {
-    if (!peer || !peer.id || !remotePeerId) return;
+function getOrCreatePeer(peerId, username = null) {
+    let entry = peers.get(peerId);
+    if (!entry) {
+        entry = {
+            id: peerId,
+            username: sanitizeUsername(username, peerId),
+            conn: null,
+            hasConnectedOnce: false,
+            announcedJoin: false,
+            left: false,
+            lastPong: Date.now(),
+            rtt: null,
+            reconnectAttempts: 0,
+            reconnectTimer: null,
+            outbox: []
+        };
+        peers.set(peerId, entry);
+    } else if (username) {
+        entry.username = sanitizeUsername(username, peerId);
+    }
+    return entry;
+}
 
-    // The peer with the lexicographically smaller ID leads the reconnect
-    isReconnectLeader = peer.id < remotePeerId;
+function clearReconnectTimer(entry) {
+    if (entry.reconnectTimer) {
+        clearTimeout(entry.reconnectTimer);
+        entry.reconnectTimer = null;
+    }
+}
 
-    console.log(
-        "Reconnect leader:",
-        isReconnectLeader ? "YES" : "NO"
-    );
+function getConnectedPeerSummaries(excludePeerId = null) {
+    const list = [];
+    for (const entry of peers.values()) {
+        if (entry.id !== excludePeerId && entry.conn && entry.conn.open) {
+            list.push({ id: entry.id, username: entry.username });
+        }
+    }
+    return list;
+}
+
+function broadcastToOpenPeers(payload, excludePeerId = null) {
+    for (const entry of peers.values()) {
+        if (entry.id !== excludePeerId && entry.conn && entry.conn.open) {
+            try {
+                entry.conn.send(payload);
+            } catch (e) {
+                console.warn("Broadcast failed to", entry.id, e);
+            }
+        }
+    }
+}
+
+function handleDiscoveredPeers(peerList) {
+    if (!Array.isArray(peerList) || !peer || !peer.id) return;
+
+    for (const info of peerList) {
+        if (!info || !info.id || info.id === peer.id) continue;
+
+        const existing = peers.get(info.id);
+        if (existing) {
+            if (info.username) {
+                existing.username = sanitizeUsername(info.username, info.id);
+            }
+            if (existing.conn && existing.conn.open) continue;
+        }
+
+        // Deterministic mesh initiator: lexicographically smaller Peer ID dials
+        if (peer.id < info.id) {
+            const entry = getOrCreatePeer(info.id, info.username);
+            if (!entry.conn && !entry.left) {
+                console.log("Auto-connecting to mesh peer:", info.id);
+                connectToPlayer(info.id, true);
+            }
+        }
+    }
+
+    renderUserList();
 }
 
 // ==========================================
-// CONNECT TO PLAYER
+// CONNECT TO ROOM / PEER
 // ==========================================
 
-function connectToPlayer(id) {
+function connectToPlayer(id, isAuto = false) {
     id = id.trim();
 
     if (!id) return;
@@ -347,15 +591,23 @@ function connectToPlayer(id) {
         return;
     }
 
-    if (connection && connection.open) {
-        setStatus("Already connected!");
+    const entry = getOrCreatePeer(id);
+    entry.left = false;
+
+    if (entry.conn && entry.conn.open) {
+        if (!isAuto) setStatus("Already connected to this user!");
         return;
     }
 
-    remotePeerId = id;
-    reconnectAttempts = 0;
+    if (entry.conn && !entry.conn.open) {
+        if (!isAuto) setStatus("Connection already in progress...");
+        return;
+    }
 
-    setStatus("Connecting to player...");
+    if (!isAuto) {
+        entry.reconnectAttempts = 0;
+        setStatus("Connecting to room...");
+    }
 
     const conn = peer.connect(id, {
         reliable: true
@@ -369,70 +621,69 @@ function connectToPlayer(id) {
 // ==========================================
 
 function setupConnection(conn) {
-    if (connection && connection.open) {
-        conn.close();
-        return;
-    }
+    const entry = getOrCreatePeer(conn.peer);
+    entry.left = false;
 
-    // Close any stale half-open previous connection before replacing it
-    if (connection && connection !== conn && !connection.open) {
+    if (entry.conn && entry.conn !== conn && !entry.conn.open) {
         try {
-            connection.close();
+            entry.conn.close();
         } catch (e) {
             console.warn("Failed closing stale connection:", e);
         }
     }
 
-    connection = conn;
-    remotePeerId = conn.peer;
-
-    updateReconnectLeader();
+    entry.conn = conn;
+    renderUserList();
 
     console.log("Setting up connection:", conn.peer);
 
     conn.on("iceStateChanged", state => {
         console.log("ICE state:", state);
 
-        if (!conn.open) {
-            setStatus(`Connecting (ICE: ${state})...`);
-        }
-
         if (state === "failed" && !conn.open) {
             console.warn("ICE negotiation failed before DataConnection opened");
-            if (connection === conn) {
-                connection = null;
+            if (entry.conn === conn) {
+                entry.conn = null;
+                entry.rtt = null;
+                markOutboxUnsent(entry);
             }
-            updatePingUI(playerPingEl, null);
             try {
                 conn.close();
             } catch (e) {
                 // ignore
             }
-            setStatus("P2P connection failed (NAT/firewall). Retrying...");
-            scheduleReconnect();
+            renderUserList();
+            updateAggregatedPing();
+            if (!entry.left) scheduleReconnect(entry.id);
         }
     });
 
     conn.on("open", () => {
         console.log("P2P connection established");
 
-        hasConnectedOnce = true;
-        reconnectAttempts = 0;
-        lastPong = Date.now();
-
-        setStatus("P2P connection established!");
-        addMessage("SYSTEM", "Player connected!");
+        entry.hasConnectedOnce = true;
+        entry.reconnectAttempts = 0;
+        entry.lastPong = Date.now();
+        clearReconnectTimer(entry);
 
         // Close the QR modal automatically once connected
         closeQrModal();
 
-        startHeartbeat();
+        ensureHeartbeatRunning();
+        sendPingToPeer(entry);
 
         conn.send({
-            type: "resume",
+            type: "hello",
             peerId: peer.id,
+            username: getUsername(),
+            peers: getConnectedPeerSummaries(conn.peer),
             timestamp: Date.now()
         });
+
+        flushGlobalPendingQueue();
+        flushPeerOutbox(entry);
+        updateRoomStatus();
+        renderUserList();
     });
 
     conn.on("data", data => {
@@ -448,90 +699,283 @@ function setupConnection(conn) {
         }
 
         if (data.type === "pong") {
-            lastPong = Date.now();
+            entry.lastPong = Date.now();
             if (typeof data.sentAt === "number") {
-                const rtt = Math.max(0, Math.round(performance.now() - data.sentAt));
-                updatePingUI(playerPingEl, rtt);
+                entry.rtt = Math.max(0, Math.round(performance.now() - data.sentAt));
+                updateAggregatedPing();
+                renderUserList();
             }
             return;
         }
 
-        // Session resume
-        if (data.type === "resume") {
-            console.log("Remote player resumed session");
-            addMessage("SYSTEM", "Session synchronized");
+        // Handshake & mesh peer discovery
+        if (data.type === "hello") {
+            entry.username = sanitizeUsername(data.username, entry.id);
+
+            if (!entry.announcedJoin) {
+                entry.announcedJoin = true;
+                addSystemMessage(`${entry.username} joined the room`);
+            }
+
+            handleDiscoveredPeers(data.peers);
+            broadcastToOpenPeers(
+                {
+                    type: "peer-list",
+                    peers: [{ id: entry.id, username: entry.username }]
+                },
+                entry.id
+            );
+
+            renderUserList();
+            flushPeerOutbox(entry);
+            return;
+        }
+
+        if (data.type === "peer-list") {
+            handleDiscoveredPeers(data.peers);
+            return;
+        }
+
+        if (data.type === "username-update") {
+            const oldName = entry.username;
+            entry.username = sanitizeUsername(data.username, entry.id);
+            if (oldName !== entry.username) {
+                addSystemMessage(`${oldName} is now known as ${entry.username}`);
+            }
+            renderUserList();
+            return;
+        }
+
+        if (data.type === "leave") {
+            entry.left = true;
+            clearReconnectTimer(entry);
+            addSystemMessage(`${entry.username} left the room`);
+
+            if (entry.conn) {
+                try {
+                    entry.conn.close();
+                } catch (e) {
+                    // ignore
+                }
+            }
+
+            peers.delete(entry.id);
+            for (const [msgId, record] of sentMessages.entries()) {
+                if (!record.ackedRecipients.has(entry.id)) {
+                    record.totalRecipients.delete(entry.id);
+                    updateSentMessageStatus(msgId);
+                }
+            }
+            renderUserList();
+            updateRoomStatus();
+            updateAggregatedPing();
+            updateQueueStatusUI();
+            return;
+        }
+
+        // Delivery ACK
+        if (data.type === "ack") {
+            handleMessageAck(entry, data.msgId);
             return;
         }
 
         // Chat message
         if (data.type === "chat") {
-            addMessage("PLAYER", data.message);
+            if (data.id) {
+                conn.send({
+                    type: "ack",
+                    msgId: data.id
+                });
+
+                if (seenMessageIds.has(data.id)) {
+                    return;
+                }
+                seenMessageIds.add(data.id);
+            }
+
+            const senderLabel = sanitizeUsername(data.senderName || entry.username, entry.id);
+            addMessage(senderLabel, data.message, { timestamp: data.timestamp });
             return;
         }
     });
 
     conn.on("close", () => {
+        if (entry.conn !== conn) return;
+
         console.warn("P2P connection closed");
 
-        stopHeartbeat();
-        updatePingUI(playerPingEl, null);
+        entry.conn = null;
+        entry.rtt = null;
+        markOutboxUnsent(entry);
 
-        if (connection === conn) {
-            connection = null;
+        if (!entry.left) {
+            if (entry.announcedJoin) {
+                addSystemMessage(`${entry.username} disconnected (messages will be queued)`);
+            }
+            entry.announcedJoin = false;
+            scheduleReconnect(entry.id);
         }
 
-        setStatus("Connection lost. Reconnecting...");
-        addMessage("SYSTEM", "Player disconnected");
-
-        scheduleReconnect();
+        renderUserList();
+        updateRoomStatus();
+        updateAggregatedPing();
+        updateQueueStatusUI();
     });
 
     conn.on("error", error => {
         console.error("DataConnection error:", error);
 
-        if (connection === conn && !conn.open) {
-            connection = null;
-            updatePingUI(playerPingEl, null);
+        if (entry.conn === conn && !conn.open) {
+            entry.conn = null;
+            entry.rtt = null;
+            markOutboxUnsent(entry);
+            if (!entry.left) {
+                scheduleReconnect(entry.id);
+            }
         }
 
-        setStatus("Connection error");
-        scheduleReconnect();
+        renderUserList();
+        updateRoomStatus();
+        updateAggregatedPing();
     });
+}
+
+// ==========================================
+// MESSAGE BUFFERING & DELIVERY QUEUE
+// ==========================================
+
+function markOutboxUnsent(entry) {
+    for (const item of entry.outbox) {
+        item.sent = false;
+    }
+}
+
+function flushGlobalPendingQueue() {
+    if (globalPendingQueue.length === 0) return;
+
+    const activePeers = Array.from(peers.values()).filter(e => !e.left);
+    if (activePeers.length === 0) return;
+
+    const queued = globalPendingQueue.splice(0);
+    for (const item of queued) {
+        const record = sentMessages.get(item.id);
+        for (const entry of activePeers) {
+            if (record) record.totalRecipients.add(entry.id);
+            entry.outbox.push({
+                id: item.id,
+                message: item.message,
+                timestamp: item.timestamp,
+                sent: false
+            });
+        }
+        updateSentMessageStatus(item.id);
+    }
+
+    for (const entry of activePeers) {
+        flushPeerOutbox(entry);
+    }
+    updateQueueStatusUI();
+}
+
+function flushPeerOutbox(entry) {
+    if (!entry.conn || !entry.conn.open || entry.outbox.length === 0) return;
+
+    for (const item of entry.outbox) {
+        if (item.sent) continue;
+
+        try {
+            entry.conn.send({
+                type: "chat",
+                id: item.id,
+                message: item.message,
+                senderId: peer.id,
+                senderName: getUsername(),
+                timestamp: item.timestamp
+            });
+            item.sent = true;
+        } catch (err) {
+            console.warn("Failed sending queued message to", entry.id, err);
+            item.sent = false;
+            break;
+        }
+    }
+
+    renderUserList();
+}
+
+function handleMessageAck(entry, msgId) {
+    if (!msgId) return;
+
+    entry.outbox = entry.outbox.filter(item => item.id !== msgId);
+
+    const record = sentMessages.get(msgId);
+    if (record) {
+        record.ackedRecipients.add(entry.id);
+        updateSentMessageStatus(msgId);
+    }
+
+    renderUserList();
+    updateQueueStatusUI();
+}
+
+function updateSentMessageStatus(msgId) {
+    const record = sentMessages.get(msgId);
+    if (!record || !record.statusEl) return;
+
+    const total = record.totalRecipients.size;
+    const acked = record.ackedRecipients.size;
+
+    record.statusEl.classList.remove("queued", "delivered");
+
+    if (total === 0) {
+        record.statusEl.classList.add("queued");
+        record.statusEl.textContent = "[Queued: waiting for users]";
+    } else if (acked >= total) {
+        record.statusEl.classList.add("delivered");
+        record.statusEl.textContent = total > 1 ? `[Delivered ${acked}/${total}]` : "[Delivered]";
+    } else {
+        record.statusEl.classList.add("queued");
+        record.statusEl.textContent = `[Buffered ${acked}/${total}]`;
+    }
 }
 
 // ==========================================
 // HEARTBEAT & P2P PING
 // ==========================================
 
-function sendPlayerPing() {
-    if (!connection || !connection.open) return;
+function sendPingToPeer(entry) {
+    if (!entry.conn || !entry.conn.open) return;
 
-    const elapsed = Date.now() - lastPong;
+    const elapsed = Date.now() - entry.lastPong;
 
     if (elapsed > HEARTBEAT_TIMEOUT) {
-        console.warn("Heartbeat timeout");
-        setStatus("Player not responding...");
-        updatePingUI(playerPingEl, null);
-        connection.close();
+        console.warn("Heartbeat timeout for peer:", entry.id);
+        entry.conn.close();
         return;
     }
 
-    connection.send({
+    entry.conn.send({
         type: "ping",
         sentAt: performance.now(),
         timestamp: Date.now()
     });
 }
 
-function startHeartbeat() {
-    stopHeartbeat();
+function ensureHeartbeatRunning() {
+    if (heartbeatTimer) return;
 
-    lastPong = Date.now();
-
-    // Send one immediately so P2P ping appears right away
-    sendPlayerPing();
-
-    heartbeatTimer = setInterval(sendPlayerPing, HEARTBEAT_INTERVAL);
+    heartbeatTimer = setInterval(() => {
+        let hasOpen = false;
+        for (const entry of peers.values()) {
+            if (entry.conn && entry.conn.open) {
+                hasOpen = true;
+                sendPingToPeer(entry);
+            }
+        }
+        if (!hasOpen && peers.size === 0) {
+            stopHeartbeat();
+        }
+    }, HEARTBEAT_INTERVAL);
 }
 
 function stopHeartbeat() {
@@ -545,42 +989,46 @@ function stopHeartbeat() {
 // AUTOMATIC P2P RECONNECTION
 // ==========================================
 
-function scheduleReconnect() {
+function scheduleReconnect(peerId) {
     if (destroyed) return;
-    if (!remotePeerId) return;
+    if (!peerId || !peer || !peer.id) return;
+
+    const entry = peers.get(peerId);
+    if (!entry || entry.left) return;
 
     // Only enforce reconnect leadership after both peers have connected once
     // and know each other's Peer ID.
-    if (hasConnectedOnce && !isReconnectLeader) return;
-    if (reconnectTimer) return;
+    const isLeader = peer.id < entry.id;
+    if (entry.hasConnectedOnce && !isLeader) return;
+    if (entry.reconnectTimer) return;
 
-    if (connection && connection.open) return;
+    if (entry.conn && entry.conn.open) return;
 
     const delay = Math.min(
-        RECONNECT_BASE_DELAY * Math.pow(2, reconnectAttempts),
+        RECONNECT_BASE_DELAY * Math.pow(2, entry.reconnectAttempts),
         RECONNECT_MAX_DELAY
     );
 
-    reconnectAttempts++;
+    entry.reconnectAttempts++;
 
-    console.log(`Reconnect attempt in ${delay}ms`);
+    console.log(`Reconnect attempt to ${peerId} in ${delay}ms`);
 
-    reconnectTimer = setTimeout(() => {
-        reconnectTimer = null;
+    entry.reconnectTimer = setTimeout(() => {
+        entry.reconnectTimer = null;
 
         if (destroyed) return;
-        if (connection && connection.open) return;
+        if (entry.left || (entry.conn && entry.conn.open)) return;
 
         if (!peer || peer.destroyed || peer.disconnected || !peer.id) {
             retrySignaling();
-            scheduleReconnect();
+            scheduleReconnect(peerId);
             return;
         }
 
-        console.log("Attempting P2P reconnection...");
-        setStatus("Reconnecting to player...");
+        console.log("Attempting P2P reconnection to", peerId);
+        updateRoomStatus();
 
-        const conn = peer.connect(remotePeerId, {
+        const conn = peer.connect(peerId, {
             reliable: true
         });
 
@@ -639,25 +1087,82 @@ qrModal.addEventListener("click", event => {
 });
 
 // ==========================================
+// USERNAME MANAGEMENT
+// ==========================================
+
+function applyUsername() {
+    const name = getUsername();
+    usernameInput.value = name;
+    sessionStorage.setItem(USERNAME_STORAGE_KEY, name);
+
+    broadcastToOpenPeers({
+        type: "username-update",
+        username: name
+    });
+
+    renderUserList();
+    setStatus(`Nickname set to "${name}"`);
+}
+
+saveUsernameBtn.onclick = applyUsername;
+
+usernameInput.addEventListener("keydown", event => {
+    if (event.key === "Enter") {
+        applyUsername();
+    }
+});
+
+// ==========================================
 // CHAT
 // ==========================================
 
 function sendMessage() {
-    const message = messageInput.value.trim();
+    const text = messageInput.value.trim();
 
-    if (!message) return;
+    if (!text) return;
 
-    if (!connection || !connection.open) {
-        setStatus("No active player connection");
+    if (!peer || !peer.id) {
+        setStatus("PeerJS is not ready yet");
         return;
     }
 
-    connection.send({
-        type: "chat",
-        message: message
+    const msgId = `${peer.id}-${++messageCounter}-${Date.now()}`;
+    const timestamp = Date.now();
+    const statusEl = addMessage(`YOU (${getUsername()})`, text, {
+        timestamp,
+        isSelf: true,
+        initialStatus: "[Queued]"
     });
 
-    addMessage("YOU", message);
+    const activeTargets = Array.from(peers.values()).filter(e => !e.left);
+    const totalSet = new Set();
+
+    if (activeTargets.length === 0) {
+        globalPendingQueue.push({ id: msgId, message: text, timestamp });
+    } else {
+        for (const entry of activeTargets) {
+            totalSet.add(entry.id);
+            entry.outbox.push({
+                id: msgId,
+                message: text,
+                timestamp,
+                sent: false
+            });
+        }
+    }
+
+    sentMessages.set(msgId, {
+        totalRecipients: totalSet,
+        ackedRecipients: new Set(),
+        statusEl
+    });
+
+    for (const entry of activeTargets) {
+        flushPeerOutbox(entry);
+    }
+
+    updateSentMessageStatus(msgId);
+    updateQueueStatusUI();
     messageInput.value = "";
 }
 
@@ -678,7 +1183,7 @@ document.getElementById("connect").onclick = () => {
 };
 
 // ==========================================
-// COPY PEER ID
+// COPY PEER ID & INVITE LINK
 // ==========================================
 
 document.getElementById("copy-id").onclick = async () => {
@@ -693,6 +1198,19 @@ document.getElementById("copy-id").onclick = async () => {
     }
 };
 
+document.getElementById("copy-invite").onclick = async () => {
+    if (!peer || !peer.id) return;
+
+    const inviteUrl = `${getBaseUrl()}?join=${encodeURIComponent(peer.id)}`;
+    try {
+        await navigator.clipboard.writeText(inviteUrl);
+        setStatus("Invite link copied! Open it in another browser to join.");
+    } catch (error) {
+        console.error("Clipboard error:", error);
+        setStatus("Could not copy invite link");
+    }
+};
+
 // ==========================================
 // PAGE CLEANUP
 // ==========================================
@@ -700,11 +1218,16 @@ document.getElementById("copy-id").onclick = async () => {
 window.addEventListener("beforeunload", () => {
     destroyed = true;
 
+    broadcastToOpenPeers({
+        type: "leave",
+        peerId: peer ? peer.id : null
+    });
+
     stopHeartbeat();
     stopServerPing();
 
-    if (reconnectTimer) {
-        clearTimeout(reconnectTimer);
+    for (const entry of peers.values()) {
+        clearReconnectTimer(entry);
     }
 
     if (signalingRetryTimer) {

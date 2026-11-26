@@ -3,8 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>PeerJS P2P Test</title>
-    <link rel="stylesheet" href="style.css?v=3">
+    <title>PeerJS P2P Chat Room</title>
+    <link rel="stylesheet" href="style.css?v=4">
 
     <!-- PeerJS client -->
     <script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script>
@@ -13,13 +13,13 @@
 </head>
 <body>
     <main>
-        <h1>PeerJS P2P Test</h1>
+        <h1>PeerJS P2P Chat Room</h1>
 
         <p id="status">Connecting to PeerJS Cloud...</p>
 
         <div class="ping-bar">
             <div class="ping-item">
-                <span class="ping-label">Player Ping (P2P):</span>
+                <span class="ping-label">Room Ping (P2P avg):</span>
                 <code id="player-ping" class="ping-value">-- ms</code>
             </div>
             <div class="ping-item">
@@ -29,21 +29,36 @@
         </div>
 
         <section>
+            <h2>Your Nickname</h2>
+            <div class="inline-row">
+                <input id="username" placeholder="Enter your nickname...">
+                <button id="save-username">Set Name</button>
+            </div>
+        </section>
+
+        <section>
             <h2>Your Peer ID</h2>
             <code id="my-id">Connecting...</code>
             <br><br>
             <button id="copy-id">Copy ID</button>
+            <button id="copy-invite">Copy Invite Link</button>
             <button id="show-qr">Show QR Code</button>
         </section>
 
         <section>
-            <h2>Join another player</h2>
-            <input id="remote-id" placeholder="Enter player's ID">
-            <button id="connect">Connect</button>
+            <h2>Join Chat Room</h2>
+            <input id="remote-id" placeholder="Enter host or peer ID">
+            <button id="connect">Join</button>
+        </section>
+
+        <section>
+            <h2>Room Users (<span id="user-count">1</span>)</h2>
+            <ul id="user-list"></ul>
         </section>
 
         <section>
             <h2>Chat</h2>
+            <div id="queue-status"></div>
             <div id="messages"></div>
             <input id="message" placeholder="Write a message...">
             <button id="send">Send</button>
@@ -63,6 +78,6 @@
         </div>
     </div>
 
-    <script src="script.js?v=3"></script>
+    <script src="script.js?v=4"></script>
 </body>
 </html>
