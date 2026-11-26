@@ -26,11 +26,13 @@ const qrUrlText = document.getElementById("qr-url-text");
 
 // Configuration
 const HEARTBEAT_INTERVAL = 3000;
-const HEARTBEAT_TIMEOUT = 90000;
+const MAX_MISSED_PINGS = 5;
+const MESSAGE_ACK_TIMEOUT = 10000;
 const SERVER_PING_INTERVAL = 10000;
-const RECONNECT_BASE_DELAY = 2000;
+const RECONNECT_BASE_DELAY = 1500;
 const RECONNECT_MAX_DELAY = 15000;
-const CONNECT_TIMEOUT = 12000;
+const CONNECT_TIMEOUT = 10000;
+const HOST_PROMOTION_ATTEMPTS = 3;
 const USERNAME_STORAGE_KEY = "peerjs_chat_username";
 
 // ICE Servers (STUN + TURN)
@@ -74,6 +76,7 @@ let roomUsers = []; // Roster synced from Host to Clients
 
 // Reconnection state
 let signalingRetryTimer = null;
+let signalingRetryAttempts = 0;
 let destroyed = false;
 
 // Heartbeat & Ping state
@@ -460,6 +463,7 @@ function attachPeerListeners(currentPeer) {
         console.log("PeerJS connected:", id);
 
         attemptingHostClaim = false;
+        signalingRetryAttempts = 0;
         myId.textContent = id;
         defaultUsername = `User-${id.slice(0, 4)}`;
         if (!usernameInput.value.trim()) {
@@ -500,9 +504,20 @@ function attachPeerListeners(currentPeer) {
         }
 
         const existing = peers.get(conn.peer);
-        if (existing && existing.conn && existing.conn.open) {
-            conn.close();
-            return;
+        if (existing && existing.conn && existing.conn !== conn) {
+            // Replace stale/half-open connection when a client reconnects with the same Peer ID
+            const staleConn = existing.conn;
+            existing.conn = null;
+            existing.rtt = null;
+            existing.awaitingPong = false;
+            existing.unansweredPings = 0;
+            clearConnectTimer(existing);
+            markOutboxUnsent(existing);
+            try {
+                staleConn.close();
+            } catch (e) {
+                // ignore
+            }
         }
 
         setupConnection(conn);
@@ -542,16 +557,25 @@ function attachPeerListeners(currentPeer) {
 
         if (error.type === "peer-unavailable") {
             const match = error.message && error.message.match(/peer\s+([^\s]+)/i);
-            const unavailableId = match ? match[1] : null;
+            const unavailableId = (match && match[1]) || hostPeerId;
 
             if (!isHost && unavailableId && peers.has(unavailableId)) {
                 const entry = peers.get(unavailableId);
+                clearConnectTimer(entry);
                 if (entry.conn && !entry.conn.open) {
                     entry.conn = null;
                     entry.rtt = null;
                 }
                 if (!entry.left) {
-                    scheduleReconnect(unavailableId);
+                    if (
+                        !autoJoinId &&
+                        unavailableId === getRoomHostId() &&
+                        entry.reconnectAttempts >= HOST_PROMOTION_ATTEMPTS
+                    ) {
+                        promoteToHost(entry);
+                    } else {
+                        scheduleReconnect(unavailableId);
+                    }
                 }
                 renderUserList();
             }
@@ -581,19 +605,37 @@ function retrySignaling() {
     signalingRetryTimer = setTimeout(() => {
         signalingRetryTimer = null;
 
-        if (destroyed || !peer || peer.destroyed) return;
+        if (destroyed) return;
+
+        if (!peer || peer.destroyed || signalingRetryAttempts >= 3) {
+            console.log("Recreating PeerJS signaling session...");
+            signalingRetryAttempts = 0;
+            const oldPeer = peer;
+            peer = null;
+            if (oldPeer && !oldPeer.destroyed) {
+                try {
+                    oldPeer.destroy();
+                } catch (e) {
+                    // ignore
+                }
+            }
+            if (isHost) {
+                startHostPeer(hostPeerId || getRoomHostId());
+            } else {
+                startClientPeer(hostPeerId || getRoomHostId());
+            }
+            return;
+        }
 
         if (peer.disconnected) {
+            signalingRetryAttempts++;
             console.log("Reconnecting to PeerJS Cloud...");
             try {
                 peer.reconnect();
             } catch (error) {
                 console.error("Signaling reconnect failed:", error);
             }
-            // Keep retrying if signaling is still disconnected
-            if (peer.disconnected) {
-                retrySignaling();
-            }
+            if (peer.disconnected) retrySignaling();
         }
     }, 3000);
 }
@@ -603,7 +645,7 @@ window.addEventListener("online", () => {
 
     measureServerPing();
 
-    if (peer && peer.disconnected) {
+    if (!peer || peer.destroyed || peer.disconnected) {
         retrySignaling();
     }
 
@@ -639,7 +681,8 @@ function getOrCreatePeer(peerId, username = null) {
             announcedJoin: false,
             left: false,
             lastPong: Date.now(),
-            missedHeartbeats: 0,
+            unansweredPings: 0,
+            awaitingPong: false,
             rtt: null,
             reconnectAttempts: 0,
             reconnectTimer: null,
@@ -828,6 +871,7 @@ function createNewRoom() {
     remoteId.value = "";
     autoJoinId = null;
     attemptingHostClaim = false;
+    signalingRetryAttempts = 0;
 
     const oldPeer = peer;
     peer = null;
@@ -854,6 +898,87 @@ function createNewRoom() {
             startHostPeer(getRoomHostId());
         }
     }, 100);
+}
+
+function promoteToHost(oldHostEntry) {
+    console.log("Default room host unavailable; promoting this client to relay host...");
+
+    if (oldHostEntry) {
+        clearReconnectTimer(oldHostEntry);
+        clearConnectTimer(oldHostEntry);
+        for (const item of oldHostEntry.outbox) {
+            if (!globalPendingQueue.some(q => q.id === item.id)) {
+                globalPendingQueue.push({
+                    id: item.id,
+                    message: item.message,
+                    senderId: item.senderId,
+                    senderName: item.senderName,
+                    timestamp: item.timestamp
+                });
+            }
+        }
+    }
+
+    peers.clear();
+    roomUsers = [];
+
+    const oldPeer = peer;
+    peer = null;
+    if (oldPeer && !oldPeer.destroyed) {
+        try {
+            oldPeer.destroy();
+        } catch (e) {
+            // ignore
+        }
+    }
+
+    addSystemMessage("Previous host left. Becoming the new room relay host...");
+    setTimeout(() => {
+        if (!destroyed) {
+            startHostPeer(getRoomHostId());
+        }
+    }, 150);
+}
+
+function forceDisconnectAndReconnect(entry, reason) {
+    if (!entry) return;
+
+    console.warn(`Disconnecting peer ${entry.id}: ${reason}`);
+    clearConnectTimer(entry);
+
+    const oldConn = entry.conn;
+    entry.conn = null;
+    entry.rtt = null;
+    entry.awaitingPong = false;
+    entry.unansweredPings = 0;
+    if (!isHost) roomUsers = [];
+    markOutboxUnsent(entry);
+
+    if (oldConn) {
+        try {
+            oldConn.close();
+        } catch (e) {
+            // ignore
+        }
+    }
+
+    if (!entry.left) {
+        if (entry.announcedJoin) {
+            if (isHost) {
+                broadcastSystemEvent(`${entry.username} lost connection (${reason}). Waiting to reconnect...`, entry.id);
+            } else {
+                addSystemMessage(`Disconnected (${reason}). Reconnecting to chatroom...`);
+            }
+        }
+        entry.announcedJoin = false;
+        if (!isHost) scheduleReconnect(entry.id);
+    }
+
+    if (isHost) broadcastRoomRoster();
+    renderUserList();
+    updateRoomStatus();
+    updateAggregatedPing();
+    updateQueueStatusUI();
 }
 
 // ==========================================
@@ -899,22 +1024,10 @@ function setupConnection(conn) {
     conn.on("iceStateChanged", state => {
         console.log("ICE state:", state);
 
-        if (state === "failed" && !conn.open) {
-            console.warn("ICE negotiation failed before DataConnection opened");
-            clearConnectTimer(entry);
-            if (entry.conn === conn) {
-                entry.conn = null;
-                entry.rtt = null;
-                markOutboxUnsent(entry);
-            }
-            try {
-                conn.close();
-            } catch (e) {
-                // ignore
-            }
-            renderUserList();
-            updateAggregatedPing();
-            if (!isHost && !entry.left) scheduleReconnect(entry.id);
+        if (entry.conn !== conn) return;
+
+        if (state === "failed" || (state === "closed" && !conn.open)) {
+            forceDisconnectAndReconnect(entry, `ICE ${state}`);
         }
     });
 
@@ -925,7 +1038,8 @@ function setupConnection(conn) {
         entry.hasConnectedOnce = true;
         entry.reconnectAttempts = 0;
         entry.lastPong = Date.now();
-        entry.missedHeartbeats = 0;
+        entry.unansweredPings = 0;
+        entry.awaitingPong = false;
         clearReconnectTimer(entry);
 
         // Close the QR modal automatically once connected
@@ -964,7 +1078,8 @@ function setupConnection(conn) {
 
         if (data.type === "pong") {
             entry.lastPong = Date.now();
-            entry.missedHeartbeats = 0;
+            entry.unansweredPings = 0;
+            entry.awaitingPong = false;
             if (typeof data.sentAt === "number") {
                 entry.rtt = Math.max(0, Math.round(performance.now() - data.sentAt));
                 updateAggregatedPing();
@@ -1161,6 +1276,7 @@ function setupConnection(conn) {
 function markOutboxUnsent(entry) {
     for (const item of entry.outbox) {
         item.sent = false;
+        delete item.sentAt;
     }
 }
 
@@ -1178,7 +1294,7 @@ function flushGlobalPendingQueue() {
             entry.outbox.push({
                 id: item.id,
                 message: item.message,
-                senderId: item.senderId || peer.id,
+                senderId: (item.senderId && item.senderId !== "pending") ? item.senderId : peer.id,
                 senderName: item.senderName || getUsername(),
                 timestamp: item.timestamp,
                 sent: false
@@ -1199,24 +1315,42 @@ function flushPeerOutbox(entry) {
     for (const item of entry.outbox) {
         if (item.sent) continue;
 
-        try {
-            entry.conn.send({
-                type: "chat",
-                id: item.id,
-                message: item.message,
-                senderId: item.senderId || peer.id,
-                senderName: item.senderName || getUsername(),
-                timestamp: item.timestamp
-            });
+        const senderId = item.senderId && item.senderId !== "pending" ? item.senderId : peer.id;
+        const ok = safeSend(entry.conn, {
+            type: "chat",
+            id: item.id,
+            message: item.message,
+            senderId,
+            senderName: item.senderName || getUsername(),
+            timestamp: item.timestamp
+        });
+
+        if (ok) {
             item.sent = true;
-        } catch (err) {
-            console.warn("Failed sending queued message to", entry.id, err);
+            item.sentAt = Date.now();
+        } else {
             item.sent = false;
-            break;
+            forceDisconnectAndReconnect(entry, "Message delivery failed");
+            return;
         }
     }
 
     renderUserList();
+}
+
+function checkMessageDeliveryTimeouts(entry) {
+    if (!entry.conn || !entry.conn.open || entry.outbox.length === 0) return false;
+
+    const now = Date.now();
+    const timedOut = entry.outbox.some(
+        item => item.sent && typeof item.sentAt === "number" && now - item.sentAt >= MESSAGE_ACK_TIMEOUT
+    );
+
+    if (timedOut) {
+        forceDisconnectAndReconnect(entry, "Message delivery timed out (no ACK)");
+        return true;
+    }
+    return false;
 }
 
 function handleMessageAck(entry, msgId) {
@@ -1259,36 +1393,45 @@ function updateSentMessageStatus(msgId) {
 // HEARTBEAT & P2P PING
 // ==========================================
 
-function sendPingToPeer(entry) {
+function sendPingToPeer(entry, fromVisibility = false) {
     if (!entry.conn || !entry.conn.open) return;
 
-    const elapsed = Date.now() - entry.lastPong;
-
-    if (elapsed > HEARTBEAT_INTERVAL * 2) {
-        entry.missedHeartbeats = (entry.missedHeartbeats || 0) + 1;
+    if (!fromVisibility && entry.awaitingPong) {
+        entry.unansweredPings = (entry.unansweredPings || 0) + 1;
     }
 
-    if (entry.missedHeartbeats >= 10 && elapsed > HEARTBEAT_TIMEOUT) {
-        console.warn("Heartbeat timeout for peer:", entry.id);
-        entry.conn.close();
+    if (entry.unansweredPings >= MAX_MISSED_PINGS) {
+        forceDisconnectAndReconnect(entry, `No response to ${MAX_MISSED_PINGS} pings in a row`);
         return;
     }
 
-    safeSend(entry.conn, {
+    entry.awaitingPong = true;
+    const ok = safeSend(entry.conn, {
         type: "ping",
         sentAt: performance.now(),
         timestamp: Date.now()
     });
+
+    if (!ok) {
+        forceDisconnectAndReconnect(entry, "Ping send failed");
+    }
 }
 
 // Reset background-tab throttling grace window when user focuses a browser window again
 document.addEventListener("visibilitychange", () => {
     if (document.hidden) return;
+    const now = Date.now();
     for (const entry of peers.values()) {
         if (entry.conn && entry.conn.open) {
-            entry.lastPong = Date.now();
-            entry.missedHeartbeats = 0;
-            sendPingToPeer(entry);
+            entry.lastPong = now;
+            entry.unansweredPings = 0;
+            entry.awaitingPong = false;
+            for (const item of entry.outbox) {
+                if (item.sent) item.sentAt = now;
+            }
+            sendPingToPeer(entry, true);
+        } else if (!isHost && !entry.left) {
+            scheduleReconnect(entry.id);
         }
     }
 });
@@ -1301,6 +1444,7 @@ function ensureHeartbeatRunning() {
         for (const entry of peers.values()) {
             if (entry.conn && entry.conn.open) {
                 hasOpen = true;
+                if (checkMessageDeliveryTimeouts(entry)) continue;
                 sendPingToPeer(entry);
             }
         }
@@ -1324,7 +1468,7 @@ function stopHeartbeat() {
 function scheduleReconnect(peerId) {
     if (isHost) return; // Clients always dial the Host; Host does not dial clients
     if (destroyed) return;
-    if (!peerId || !peer || !peer.id) return;
+    if (!peerId) return;
 
     const entry = peers.get(peerId);
     if (!entry || entry.left) return;
@@ -1456,12 +1600,13 @@ function sendMessage() {
 
     if (!text) return;
 
-    if (!peer || !peer.id) {
+    if ((!peer || !peer.id) && peers.size === 0) {
         setStatus("PeerJS is not ready yet");
         return;
     }
 
-    const msgId = `${peer.id}-${++messageCounter}-${Date.now()}`;
+    const localPeerId = (peer && peer.id) || "pending";
+    const msgId = `${localPeerId}-${++messageCounter}-${Date.now()}`;
     const timestamp = Date.now();
     const statusEl = addMessage(`YOU (${getUsername()})`, text, {
         timestamp,
@@ -1476,7 +1621,7 @@ function sendMessage() {
         globalPendingQueue.push({
             id: msgId,
             message: text,
-            senderId: peer.id,
+            senderId: localPeerId,
             senderName: getUsername(),
             timestamp
         });
@@ -1486,7 +1631,7 @@ function sendMessage() {
             entry.outbox.push({
                 id: msgId,
                 message: text,
-                senderId: peer.id,
+                senderId: localPeerId,
                 senderName: getUsername(),
                 timestamp,
                 sent: false
