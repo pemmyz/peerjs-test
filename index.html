@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>PeerJS P2P Chat Room</title>
-    <link rel="stylesheet" href="style.css?v=4">
+    <link rel="stylesheet" href="style.css?v=5">
 
     <!-- PeerJS client -->
     <script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script>
@@ -19,7 +19,7 @@
 
         <div class="ping-bar">
             <div class="ping-item">
-                <span class="ping-label">Room Ping (P2P avg):</span>
+                <span class="ping-label">Relay / Room Ping (P2P):</span>
                 <code id="player-ping" class="ping-value">-- ms</code>
             </div>
             <div class="ping-item">
@@ -46,9 +46,10 @@
         </section>
 
         <section>
-            <h2>Join Chat Room</h2>
-            <input id="remote-id" placeholder="Enter host or peer ID">
+            <h2>Join Specific Host (Optional)</h2>
+            <input id="remote-id" placeholder="Auto-connects to first user (or paste host ID)">
             <button id="connect">Join</button>
+            <button id="new-room" class="secondary-btn">Create New Room</button>
         </section>
 
         <section>
@@ -78,6 +79,6 @@
         </div>
     </div>
 
-    <script src="script.js?v=4"></script>
+    <script src="script.js?v=6"></script>
 </body>
 </html>

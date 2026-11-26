@@ -203,6 +203,10 @@ code {
     color: #ff9800;
 }
 
+.user-status.host {
+    color: #64b5f6;
+}
+
 /* Chat message rows & delivery status */
 .msg-row {
     margin: 6px 0;

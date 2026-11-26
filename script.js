@@ -1,6 +1,6 @@
 // ==========================================
-// PeerJS Multi-User P2P Chat Room
-// Mesh discovery + Custom nicknames + Buffered delivery queue + Heartbeat + QR Connect
+// PeerJS Host-Relayed Multi-User P2P Chat Room
+// First browser acts as Relay Host + Custom nicknames + Buffered delivery queue + Heartbeat + QR Connect
 // ==========================================
 
 // DOM elements
@@ -26,10 +26,11 @@ const qrUrlText = document.getElementById("qr-url-text");
 
 // Configuration
 const HEARTBEAT_INTERVAL = 3000;
-const HEARTBEAT_TIMEOUT = 30000;
+const HEARTBEAT_TIMEOUT = 90000;
 const SERVER_PING_INTERVAL = 10000;
 const RECONNECT_BASE_DELAY = 2000;
 const RECONNECT_MAX_DELAY = 15000;
+const CONNECT_TIMEOUT = 12000;
 const USERNAME_STORAGE_KEY = "peerjs_chat_username";
 
 // ICE Servers (STUN + TURN)
@@ -58,14 +59,18 @@ let qrCodeInstance = null;
 
 // Read query params for auto-connect: ?join=<PEER_ID>
 const urlParams = new URLSearchParams(window.location.search);
-const autoJoinId = urlParams.get("join");
+let autoJoinId = urlParams.get("join");
 
 // PeerJS state
 let peer;
 let defaultUsername = "User";
+let isHost = false;
+let attemptingHostClaim = false;
+let hostPeerId = null;
 
-// Multi-user mesh state: Map<peerId, PeerEntry>
+// Host-relay state: Map<peerId, PeerEntry> (Host tracks all clients; Clients track the Host)
 const peers = new Map();
+let roomUsers = []; // Roster synced from Host to Clients
 
 // Reconnection state
 let signalingRetryTimer = null;
@@ -87,12 +92,43 @@ if (savedUsername) {
     usernameInput.value = savedUsername;
 }
 
+// Deterministic Host Peer ID shared by browsers opening the same page/room
+function getRoomHostId() {
+    const currentParams = new URLSearchParams(window.location.search);
+    const room = currentParams.get("room") || "default";
+    const key = `${window.location.host}${window.location.pathname}#${room}`;
+    let hash = 2166136261;
+    for (let i = 0; i < key.length; i++) {
+        hash ^= key.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+    }
+    return `p2p-room-host-${(hash >>> 0).toString(36)}`;
+}
+
+function generateRoomKey() {
+    if (window.crypto && typeof window.crypto.randomUUID === "function") {
+        return window.crypto.randomUUID().split("-")[0];
+    }
+    return Math.random().toString(36).slice(2, 10);
+}
+
 // ==========================================
 // UI, PING & URL HELPERS
 // ==========================================
 
 function setStatus(text) {
     status.textContent = text;
+}
+
+function safeSend(conn, payload) {
+    if (!conn || !conn.open) return false;
+    try {
+        conn.send(payload);
+        return true;
+    } catch (err) {
+        console.warn("DataConnection send failed:", err);
+        return false;
+    }
 }
 
 function sanitizeUsername(name, fallbackId = "") {
@@ -150,10 +186,40 @@ function renderUserList() {
 
     userListEl.innerHTML = "";
 
-    // Local user row
+    if (!isHost && roomUsers.length > 0) {
+        let activeCount = 0;
+        for (const u of roomUsers) {
+            if (u.connected) activeCount++;
+            const isSelf = peer && u.id === peer.id;
+            const isRelay = u.role === "host";
+            const li = document.createElement("li");
+            li.className = "user-item";
+
+            const roleMeta = isRelay ? " · Relay Host" : "";
+            const selfMeta = isSelf ? " · You" : "";
+            const statusClass = isRelay ? "host" : (u.connected ? "connected" : "reconnecting");
+            const statusLabel = isRelay ? "Host" : (u.connected ? "Connected" : "Reconnecting");
+
+            li.innerHTML = `
+                <div>
+                    <strong>${escapeHtml(u.username)}</strong>
+                    <span class="user-meta">(${escapeHtml(u.id.slice(0, 8))}…${roleMeta}${selfMeta})</span>
+                </div>
+                <span class="user-status ${statusClass}">${statusLabel}</span>
+            `;
+            userListEl.appendChild(li);
+        }
+        if (userCountEl) {
+            userCountEl.textContent = String(activeCount || roomUsers.length);
+        }
+        return;
+    }
+
+    // Host view (or Client before first roster sync)
     const selfLi = document.createElement("li");
     selfLi.className = "user-item";
-    selfLi.innerHTML = `<div><strong>${escapeHtml(getUsername())}</strong> <span class="user-meta">(You${peer && peer.id ? ` · ${escapeHtml(peer.id.slice(0, 8))}…` : ""})</span></div><span class="user-status connected">Online</span>`;
+    const selfRole = isHost ? " · Relay Host" : "";
+    selfLi.innerHTML = `<div><strong>${escapeHtml(getUsername())}</strong> <span class="user-meta">(You${selfRole}${peer && peer.id ? ` · ${escapeHtml(peer.id.slice(0, 8))}…` : ""})</span></div><span class="user-status ${isHost ? "host" : "connected"}">${isHost ? "Host" : "Online"}</span>`;
     userListEl.appendChild(selfLi);
 
     let activeCount = 1;
@@ -168,11 +234,12 @@ function renderUserList() {
 
         const pingText = isOpen && typeof entry.rtt === "number" ? ` · ${entry.rtt} ms` : "";
         const queueText = entry.outbox.length > 0 ? ` · ${entry.outbox.length} queued` : "";
+        const roleLabel = !isHost && entry.id === hostPeerId ? " · Relay Host" : "";
 
         li.innerHTML = `
             <div>
                 <strong>${escapeHtml(entry.username)}</strong>
-                <span class="user-meta">(${escapeHtml(entry.id.slice(0, 8))}…${pingText}${queueText})</span>
+                <span class="user-meta">(${escapeHtml(entry.id.slice(0, 8))}…${roleLabel}${pingText}${queueText})</span>
             </div>
             <span class="user-status ${isOpen ? "connected" : "reconnecting"}">
                 ${isOpen ? "Connected" : "Reconnecting"}
@@ -212,13 +279,19 @@ function updateAggregatedPing() {
 }
 
 function updateRoomStatus() {
+    if (isHost) {
+        const openCount = Array.from(peers.values()).filter(e => e.conn && e.conn.open).length;
+        setStatus(`Hosting room relay (${openCount} client${openCount === 1 ? "" : "s"} connected)`);
+        return;
+    }
+
     const openCount = Array.from(peers.values()).filter(e => e.conn && e.conn.open).length;
     if (openCount > 0) {
-        setStatus(`Connected to ${openCount} user${openCount === 1 ? "" : "s"} in room`);
+        setStatus("Connected to room relay host");
     } else if (peers.size > 0) {
-        setStatus("Room disconnected. Reconnecting...");
+        setStatus("Relay host disconnected. Reconnecting...");
     } else if (peer && peer.id && !peer.disconnected) {
-        setStatus("Connected to PeerJS Cloud (waiting for users)");
+        setStatus("Connected to PeerJS Cloud");
     }
 }
 
@@ -325,8 +398,6 @@ function stopServerPing() {
 // ==========================================
 
 function initializePeer() {
-    destroyed = false;
-
     const hasTurnServer = ICE_SERVERS.some(server => {
         const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
         return urls.some(u => typeof u === "string" && (u.startsWith("turn:") || u.startsWith("turns:")));
@@ -336,48 +407,97 @@ function initializePeer() {
         console.warn("No TURN server configured in ICE_SERVERS. Connections across different networks/mobile data may hang at ICE negotiation.");
     }
 
-    setStatus("Connecting to PeerJS Cloud...");
+    const defaultHostId = getRoomHostId();
 
-    peer = new Peer({
-        debug: 3, // Logs ICE candidates, SDP offers/answers, and PeerJS errors
+    if (autoJoinId) {
+        // Explicit ?join=<HOST_ID> link: join directly as a Client
+        startClientPeer(autoJoinId);
+    } else {
+        // First browser to load claims the shared Host ID; others fall back to Client
+        startHostPeer(defaultHostId);
+    }
+}
+
+function startHostPeer(targetHostId) {
+    attemptingHostClaim = true;
+    isHost = true;
+    hostPeerId = targetHostId;
+    destroyed = false;
+
+    setStatus("Starting room (claiming relay host)...");
+
+    const currentPeer = new Peer(targetHostId, {
+        debug: 3,
         config: {
             iceServers: ICE_SERVERS
         }
     });
+    peer = currentPeer;
+    attachPeerListeners(currentPeer);
+}
 
-    peer.on("open", id => {
+function startClientPeer(targetHostId) {
+    attemptingHostClaim = false;
+    isHost = false;
+    hostPeerId = targetHostId;
+    destroyed = false;
+
+    setStatus("Connecting as client to relay host...");
+
+    const currentPeer = new Peer({
+        debug: 3,
+        config: {
+            iceServers: ICE_SERVERS
+        }
+    });
+    peer = currentPeer;
+    attachPeerListeners(currentPeer);
+}
+
+function attachPeerListeners(currentPeer) {
+    currentPeer.on("open", id => {
+        if (peer !== currentPeer) return;
         console.log("PeerJS connected:", id);
 
+        attemptingHostClaim = false;
         myId.textContent = id;
         defaultUsername = `User-${id.slice(0, 4)}`;
         if (!usernameInput.value.trim()) {
             usernameInput.placeholder = `Nickname (default: ${defaultUsername})`;
         }
 
-        setStatus("Connected to PeerJS Cloud");
         renderUserList();
+        updateRoomStatus();
 
         startServerPing();
 
-        // AUTO-CONNECT: If page was opened from QR scan or with ?join=...
-        if (autoJoinId && autoJoinId !== id && !peers.has(autoJoinId)) {
-            console.log("Auto-connecting to scanned peer:", autoJoinId);
-            remoteId.value = autoJoinId;
-            connectToPlayer(autoJoinId);
+        if (!isHost && hostPeerId && hostPeerId !== id && !peers.has(hostPeerId)) {
+            console.log("Auto-connecting to relay host:", hostPeerId);
+            remoteId.value = hostPeerId;
+            connectToPlayer(hostPeerId);
             return;
         }
 
         // If signaling recovered and any peer P2P links are down
-        for (const entry of peers.values()) {
-            if ((!entry.conn || !entry.conn.open) && !entry.left) {
-                scheduleReconnect(entry.id);
+        if (!isHost) {
+            for (const entry of peers.values()) {
+                if ((!entry.conn || !entry.conn.open) && !entry.left) {
+                    scheduleReconnect(entry.id);
+                }
             }
         }
     });
 
     // Incoming connection
-    peer.on("connection", conn => {
+    currentPeer.on("connection", conn => {
+        if (peer !== currentPeer) return;
         console.log("Incoming connection:", conn.peer);
+
+        if (!isHost) {
+            console.warn("Ignoring incoming connection because this peer is a client");
+            conn.close();
+            return;
+        }
 
         const existing = peers.get(conn.peer);
         if (existing && existing.conn && existing.conn.open) {
@@ -385,30 +505,38 @@ function initializePeer() {
             return;
         }
 
-        // Glare resolution if both sides dialed simultaneously
-        if (existing && existing.conn && existing.conn !== conn && !existing.conn.open) {
-            if (peer.id < conn.peer) {
-                conn.close();
-                return;
-            }
-            try {
-                existing.conn.close();
-            } catch (e) {
-                // ignore
-            }
-        }
-
         setupConnection(conn);
     });
 
-    peer.on("disconnected", () => {
+    currentPeer.on("disconnected", () => {
+        if (peer !== currentPeer) return;
         console.warn("PeerJS Cloud disconnected");
         setStatus("Lost PeerJS Cloud connection...");
         updatePingUI(serverPingEl, null);
         retrySignaling();
     });
 
-    peer.on("error", error => {
+    currentPeer.on("error", error => {
+        if (peer !== currentPeer) return;
+
+        // Another browser already opened first and holds the Host ID -> join as Client
+        if (attemptingHostClaim && error.type === "unavailable-id") {
+            console.log("Relay host already active; joining as client...");
+            attemptingHostClaim = false;
+            peer = null;
+            try {
+                currentPeer.destroy();
+            } catch (e) {
+                // ignore
+            }
+            setTimeout(() => {
+                if (!destroyed) {
+                    startClientPeer(hostPeerId);
+                }
+            }, 150);
+            return;
+        }
+
         console.error("PeerJS error:", error);
         setStatus("PeerJS error: " + error.type);
 
@@ -416,7 +544,7 @@ function initializePeer() {
             const match = error.message && error.message.match(/peer\s+([^\s]+)/i);
             const unavailableId = match ? match[1] : null;
 
-            if (unavailableId && peers.has(unavailableId)) {
+            if (!isHost && unavailableId && peers.has(unavailableId)) {
                 const entry = peers.get(unavailableId);
                 if (entry.conn && !entry.conn.open) {
                     entry.conn = null;
@@ -435,7 +563,8 @@ function initializePeer() {
         }
     });
 
-    peer.on("close", () => {
+    currentPeer.on("close", () => {
+        if (peer !== currentPeer) return;
         console.log("PeerJS instance closed");
         stopServerPing();
         updatePingUI(serverPingEl, null);
@@ -461,6 +590,10 @@ function retrySignaling() {
             } catch (error) {
                 console.error("Signaling reconnect failed:", error);
             }
+            // Keep retrying if signaling is still disconnected
+            if (peer.disconnected) {
+                retrySignaling();
+            }
         }
     }, 3000);
 }
@@ -474,9 +607,11 @@ window.addEventListener("online", () => {
         retrySignaling();
     }
 
-    for (const entry of peers.values()) {
-        if ((!entry.conn || !entry.conn.open) && !entry.left) {
-            scheduleReconnect(entry.id);
+    if (!isHost) {
+        for (const entry of peers.values()) {
+            if ((!entry.conn || !entry.conn.open) && !entry.left) {
+                scheduleReconnect(entry.id);
+            }
         }
     }
 });
@@ -490,7 +625,7 @@ window.addEventListener("offline", () => {
 });
 
 // ==========================================
-// MESH PEER REGISTRY & HELPERS
+// HOST-RELAY REGISTRY & HELPERS
 // ==========================================
 
 function getOrCreatePeer(peerId, username = null) {
@@ -504,9 +639,11 @@ function getOrCreatePeer(peerId, username = null) {
             announcedJoin: false,
             left: false,
             lastPong: Date.now(),
+            missedHeartbeats: 0,
             rtt: null,
             reconnectAttempts: 0,
             reconnectTimer: null,
+            connectTimer: null,
             outbox: []
         };
         peers.set(peerId, entry);
@@ -523,14 +660,11 @@ function clearReconnectTimer(entry) {
     }
 }
 
-function getConnectedPeerSummaries(excludePeerId = null) {
-    const list = [];
-    for (const entry of peers.values()) {
-        if (entry.id !== excludePeerId && entry.conn && entry.conn.open) {
-            list.push({ id: entry.id, username: entry.username });
-        }
+function clearConnectTimer(entry) {
+    if (entry.connectTimer) {
+        clearTimeout(entry.connectTimer);
+        entry.connectTimer = null;
     }
-    return list;
 }
 
 function broadcastToOpenPeers(payload, excludePeerId = null) {
@@ -545,35 +679,63 @@ function broadcastToOpenPeers(payload, excludePeerId = null) {
     }
 }
 
-function handleDiscoveredPeers(peerList) {
-    if (!Array.isArray(peerList) || !peer || !peer.id) return;
-
-    for (const info of peerList) {
-        if (!info || !info.id || info.id === peer.id) continue;
-
-        const existing = peers.get(info.id);
-        if (existing) {
-            if (info.username) {
-                existing.username = sanitizeUsername(info.username, info.id);
-            }
-            if (existing.conn && existing.conn.open) continue;
+function buildRoomRoster() {
+    const list = [
+        {
+            id: peer.id,
+            username: getUsername(),
+            role: "host",
+            connected: true
         }
-
-        // Deterministic mesh initiator: lexicographically smaller Peer ID dials
-        if (peer.id < info.id) {
-            const entry = getOrCreatePeer(info.id, info.username);
-            if (!entry.conn && !entry.left) {
-                console.log("Auto-connecting to mesh peer:", info.id);
-                connectToPlayer(info.id, true);
-            }
-        }
+    ];
+    for (const entry of peers.values()) {
+        if (entry.left) continue;
+        list.push({
+            id: entry.id,
+            username: entry.username,
+            role: "client",
+            connected: Boolean(entry.conn && entry.conn.open)
+        });
     }
+    return list;
+}
 
-    renderUserList();
+function broadcastRoomRoster() {
+    if (!isHost || !peer || !peer.id) return;
+    broadcastToOpenPeers({
+        type: "room-users",
+        users: buildRoomRoster()
+    });
+}
+
+function relayChatMessage(originPeerId, chatPayload) {
+    if (!isHost) return;
+
+    for (const entry of peers.values()) {
+        if (entry.id === originPeerId || entry.left) continue;
+
+        entry.outbox.push({
+            id: chatPayload.id,
+            message: chatPayload.message,
+            senderId: chatPayload.senderId,
+            senderName: chatPayload.senderName,
+            timestamp: chatPayload.timestamp,
+            sent: false
+        });
+        flushPeerOutbox(entry);
+    }
+    updateQueueStatusUI();
+}
+
+function broadcastSystemEvent(text, excludePeerId = null) {
+    addSystemMessage(text);
+    if (isHost) {
+        broadcastToOpenPeers({ type: "system", text }, excludePeerId);
+    }
 }
 
 // ==========================================
-// CONNECT TO ROOM / PEER
+// CONNECT TO HOST / RELAY
 // ==========================================
 
 function connectToPlayer(id, isAuto = false) {
@@ -587,9 +749,29 @@ function connectToPlayer(id, isAuto = false) {
     }
 
     if (id === peer.id) {
-        setStatus("You cannot connect to yourself!");
+        setStatus("You are already hosting this room!");
         return;
     }
+
+    // Switching to act as a client connected to the specified host ID
+    if (isHost) {
+        if (peers.size > 0) {
+            setStatus("Already hosting active room clients; open another browser to join as client.");
+            return;
+        }
+        for (const entry of peers.values()) {
+            if (entry.conn) {
+                try {
+                    entry.conn.close();
+                } catch (e) {
+                    // ignore
+                }
+            }
+        }
+        peers.clear();
+        isHost = false;
+    }
+    hostPeerId = id;
 
     const entry = getOrCreatePeer(id);
     entry.left = false;
@@ -606,7 +788,7 @@ function connectToPlayer(id, isAuto = false) {
 
     if (!isAuto) {
         entry.reconnectAttempts = 0;
-        setStatus("Connecting to room...");
+        setStatus("Connecting to relay host...");
     }
 
     const conn = peer.connect(id, {
@@ -616,6 +798,64 @@ function connectToPlayer(id, isAuto = false) {
     setupConnection(conn);
 }
 
+function createNewRoom() {
+    // Notify current room before switching
+    broadcastToOpenPeers({
+        type: "leave",
+        peerId: peer ? peer.id : null
+    });
+
+    stopHeartbeat();
+
+    for (const entry of peers.values()) {
+        clearReconnectTimer(entry);
+        clearConnectTimer(entry);
+        if (entry.conn) {
+            try {
+                entry.conn.close();
+            } catch (e) {
+                // ignore
+            }
+        }
+    }
+
+    peers.clear();
+    roomUsers = [];
+    globalPendingQueue.length = 0;
+    seenMessageIds.clear();
+    sentMessages.clear();
+    messages.innerHTML = "";
+    remoteId.value = "";
+    autoJoinId = null;
+    attemptingHostClaim = false;
+
+    const oldPeer = peer;
+    peer = null;
+    if (oldPeer && !oldPeer.destroyed) {
+        try {
+            oldPeer.destroy();
+        } catch (e) {
+            // ignore
+        }
+    }
+
+    const newRoomKey = generateRoomKey();
+    const newUrl = `${getBaseUrl()}?room=${encodeURIComponent(newRoomKey)}`;
+    window.history.replaceState({}, "", newUrl);
+
+    myId.textContent = "Connecting...";
+    updatePingUI(playerPingEl, null);
+    updateQueueStatusUI();
+    renderUserList();
+    addSystemMessage(`Created new room (key: ${newRoomKey})`);
+
+    setTimeout(() => {
+        if (!destroyed) {
+            startHostPeer(getRoomHostId());
+        }
+    }, 100);
+}
+
 // ==========================================
 // CONNECTION MANAGEMENT
 // ==========================================
@@ -623,6 +863,7 @@ function connectToPlayer(id, isAuto = false) {
 function setupConnection(conn) {
     const entry = getOrCreatePeer(conn.peer);
     entry.left = false;
+    clearConnectTimer(entry);
 
     if (entry.conn && entry.conn !== conn && !entry.conn.open) {
         try {
@@ -637,11 +878,30 @@ function setupConnection(conn) {
 
     console.log("Setting up connection:", conn.peer);
 
+    // Prevent outgoing client connections from hanging forever in ICE checking
+    if (!isHost && !conn.open) {
+        entry.connectTimer = setTimeout(() => {
+            entry.connectTimer = null;
+            if (destroyed || entry.left || entry.conn !== conn || conn.open) return;
+            console.warn("Connection attempt timed out for", entry.id);
+            entry.conn = null;
+            entry.rtt = null;
+            try {
+                conn.close();
+            } catch (e) {
+                // ignore
+            }
+            renderUserList();
+            scheduleReconnect(entry.id);
+        }, CONNECT_TIMEOUT);
+    }
+
     conn.on("iceStateChanged", state => {
         console.log("ICE state:", state);
 
         if (state === "failed" && !conn.open) {
             console.warn("ICE negotiation failed before DataConnection opened");
+            clearConnectTimer(entry);
             if (entry.conn === conn) {
                 entry.conn = null;
                 entry.rtt = null;
@@ -654,16 +914,18 @@ function setupConnection(conn) {
             }
             renderUserList();
             updateAggregatedPing();
-            if (!entry.left) scheduleReconnect(entry.id);
+            if (!isHost && !entry.left) scheduleReconnect(entry.id);
         }
     });
 
     conn.on("open", () => {
         console.log("P2P connection established");
 
+        clearConnectTimer(entry);
         entry.hasConnectedOnce = true;
         entry.reconnectAttempts = 0;
         entry.lastPong = Date.now();
+        entry.missedHeartbeats = 0;
         clearReconnectTimer(entry);
 
         // Close the QR modal automatically once connected
@@ -672,16 +934,18 @@ function setupConnection(conn) {
         ensureHeartbeatRunning();
         sendPingToPeer(entry);
 
-        conn.send({
+        safeSend(conn, {
             type: "hello",
             peerId: peer.id,
             username: getUsername(),
-            peers: getConnectedPeerSummaries(conn.peer),
             timestamp: Date.now()
         });
 
         flushGlobalPendingQueue();
         flushPeerOutbox(entry);
+        if (isHost) {
+            broadcastRoomRoster();
+        }
         updateRoomStatus();
         renderUserList();
     });
@@ -691,7 +955,7 @@ function setupConnection(conn) {
 
         // Heartbeat & P2P Ping
         if (data.type === "ping") {
-            conn.send({
+            safeSend(conn, {
                 type: "pong",
                 sentAt: data.sentAt
             });
@@ -700,6 +964,7 @@ function setupConnection(conn) {
 
         if (data.type === "pong") {
             entry.lastPong = Date.now();
+            entry.missedHeartbeats = 0;
             if (typeof data.sentAt === "number") {
                 entry.rtt = Math.max(0, Math.round(performance.now() - data.sentAt));
                 updateAggregatedPing();
@@ -708,31 +973,38 @@ function setupConnection(conn) {
             return;
         }
 
-        // Handshake & mesh peer discovery
+        // Handshake
         if (data.type === "hello") {
             entry.username = sanitizeUsername(data.username, entry.id);
 
-            if (!entry.announcedJoin) {
+            if (isHost) {
+                if (!entry.announcedJoin) {
+                    entry.announcedJoin = true;
+                    broadcastSystemEvent(`${entry.username} joined the room`, entry.id);
+                }
+                broadcastRoomRoster();
+            } else if (!entry.announcedJoin) {
                 entry.announcedJoin = true;
-                addSystemMessage(`${entry.username} joined the room`);
+                addSystemMessage(`Connected to relay host (${entry.username})`);
             }
-
-            handleDiscoveredPeers(data.peers);
-            broadcastToOpenPeers(
-                {
-                    type: "peer-list",
-                    peers: [{ id: entry.id, username: entry.username }]
-                },
-                entry.id
-            );
 
             renderUserList();
             flushPeerOutbox(entry);
             return;
         }
 
-        if (data.type === "peer-list") {
-            handleDiscoveredPeers(data.peers);
+        if (data.type === "room-users" && !isHost) {
+            if (Array.isArray(data.users)) {
+                roomUsers = data.users;
+                renderUserList();
+            }
+            return;
+        }
+
+        if (data.type === "system" && !isHost) {
+            if (data.text) {
+                addSystemMessage(data.text);
+            }
             return;
         }
 
@@ -740,16 +1012,37 @@ function setupConnection(conn) {
             const oldName = entry.username;
             entry.username = sanitizeUsername(data.username, entry.id);
             if (oldName !== entry.username) {
-                addSystemMessage(`${oldName} is now known as ${entry.username}`);
+                if (isHost) {
+                    broadcastSystemEvent(`${oldName} is now known as ${entry.username}`, entry.id);
+                    broadcastRoomRoster();
+                } else {
+                    addSystemMessage(`${oldName} is now known as ${entry.username}`);
+                }
             }
             renderUserList();
             return;
         }
 
         if (data.type === "leave") {
+            if (!isHost) {
+                // Host closed/reloaded: keep host entry and outbox so client reconnects automatically
+                clearConnectTimer(entry);
+                roomUsers = [];
+                entry.conn = null;
+                entry.rtt = null;
+                entry.announcedJoin = false;
+                markOutboxUnsent(entry);
+                addSystemMessage("Relay host went offline. Waiting to reconnect...");
+                renderUserList();
+                updateRoomStatus();
+                updateAggregatedPing();
+                scheduleReconnect(entry.id);
+                return;
+            }
+
             entry.left = true;
             clearReconnectTimer(entry);
-            addSystemMessage(`${entry.username} left the room`);
+            broadcastSystemEvent(`${entry.username} left the room`, entry.id);
 
             if (entry.conn) {
                 try {
@@ -766,6 +1059,7 @@ function setupConnection(conn) {
                     updateSentMessageStatus(msgId);
                 }
             }
+            broadcastRoomRoster();
             renderUserList();
             updateRoomStatus();
             updateAggregatedPing();
@@ -782,7 +1076,7 @@ function setupConnection(conn) {
         // Chat message
         if (data.type === "chat") {
             if (data.id) {
-                conn.send({
+                safeSend(conn, {
                     type: "ack",
                     msgId: data.id
                 });
@@ -795,6 +1089,17 @@ function setupConnection(conn) {
 
             const senderLabel = sanitizeUsername(data.senderName || entry.username, entry.id);
             addMessage(senderLabel, data.message, { timestamp: data.timestamp });
+
+            // Host relays every incoming client message to all other clients
+            if (isHost) {
+                relayChatMessage(entry.id, {
+                    id: data.id,
+                    message: data.message,
+                    senderId: data.senderId || entry.id,
+                    senderName: senderLabel,
+                    timestamp: data.timestamp
+                });
+            }
             return;
         }
     });
@@ -804,18 +1109,25 @@ function setupConnection(conn) {
 
         console.warn("P2P connection closed");
 
+        clearConnectTimer(entry);
         entry.conn = null;
         entry.rtt = null;
+        if (!isHost) roomUsers = [];
         markOutboxUnsent(entry);
 
         if (!entry.left) {
             if (entry.announcedJoin) {
-                addSystemMessage(`${entry.username} disconnected (messages will be queued)`);
+                if (isHost) {
+                    broadcastSystemEvent(`${entry.username} disconnected (messages will be queued)`, entry.id);
+                } else {
+                    addSystemMessage("Relay host disconnected (messages will be queued)");
+                }
             }
             entry.announcedJoin = false;
-            scheduleReconnect(entry.id);
+            if (!isHost) scheduleReconnect(entry.id);
         }
 
+        if (isHost) broadcastRoomRoster();
         renderUserList();
         updateRoomStatus();
         updateAggregatedPing();
@@ -826,10 +1138,12 @@ function setupConnection(conn) {
         console.error("DataConnection error:", error);
 
         if (entry.conn === conn && !conn.open) {
+            clearConnectTimer(entry);
             entry.conn = null;
             entry.rtt = null;
+            if (!isHost) roomUsers = [];
             markOutboxUnsent(entry);
-            if (!entry.left) {
+            if (!isHost && !entry.left) {
                 scheduleReconnect(entry.id);
             }
         }
@@ -864,6 +1178,8 @@ function flushGlobalPendingQueue() {
             entry.outbox.push({
                 id: item.id,
                 message: item.message,
+                senderId: item.senderId || peer.id,
+                senderName: item.senderName || getUsername(),
                 timestamp: item.timestamp,
                 sent: false
             });
@@ -888,8 +1204,8 @@ function flushPeerOutbox(entry) {
                 type: "chat",
                 id: item.id,
                 message: item.message,
-                senderId: peer.id,
-                senderName: getUsername(),
+                senderId: item.senderId || peer.id,
+                senderName: item.senderName || getUsername(),
                 timestamp: item.timestamp
             });
             item.sent = true;
@@ -948,18 +1264,34 @@ function sendPingToPeer(entry) {
 
     const elapsed = Date.now() - entry.lastPong;
 
-    if (elapsed > HEARTBEAT_TIMEOUT) {
+    if (elapsed > HEARTBEAT_INTERVAL * 2) {
+        entry.missedHeartbeats = (entry.missedHeartbeats || 0) + 1;
+    }
+
+    if (entry.missedHeartbeats >= 10 && elapsed > HEARTBEAT_TIMEOUT) {
         console.warn("Heartbeat timeout for peer:", entry.id);
         entry.conn.close();
         return;
     }
 
-    entry.conn.send({
+    safeSend(entry.conn, {
         type: "ping",
         sentAt: performance.now(),
         timestamp: Date.now()
     });
 }
+
+// Reset background-tab throttling grace window when user focuses a browser window again
+document.addEventListener("visibilitychange", () => {
+    if (document.hidden) return;
+    for (const entry of peers.values()) {
+        if (entry.conn && entry.conn.open) {
+            entry.lastPong = Date.now();
+            entry.missedHeartbeats = 0;
+            sendPingToPeer(entry);
+        }
+    }
+});
 
 function ensureHeartbeatRunning() {
     if (heartbeatTimer) return;
@@ -990,16 +1322,13 @@ function stopHeartbeat() {
 // ==========================================
 
 function scheduleReconnect(peerId) {
+    if (isHost) return; // Clients always dial the Host; Host does not dial clients
     if (destroyed) return;
     if (!peerId || !peer || !peer.id) return;
 
     const entry = peers.get(peerId);
     if (!entry || entry.left) return;
 
-    // Only enforce reconnect leadership after both peers have connected once
-    // and know each other's Peer ID.
-    const isLeader = peer.id < entry.id;
-    if (entry.hasConnectedOnce && !isLeader) return;
     if (entry.reconnectTimer) return;
 
     if (entry.conn && entry.conn.open) return;
@@ -1048,7 +1377,8 @@ function openQrModal() {
     }
 
     const baseUrl = getBaseUrl();
-    const joinUrl = `${baseUrl}?join=${encodeURIComponent(peer.id)}`;
+    const targetId = isHost ? peer.id : (hostPeerId || peer.id);
+    const joinUrl = `${baseUrl}?join=${encodeURIComponent(targetId)}`;
 
     qrUrlText.textContent = joinUrl;
 
@@ -1095,10 +1425,15 @@ function applyUsername() {
     usernameInput.value = name;
     sessionStorage.setItem(USERNAME_STORAGE_KEY, name);
 
-    broadcastToOpenPeers({
-        type: "username-update",
-        username: name
-    });
+    if (isHost) {
+        broadcastSystemEvent(`Host is now known as ${name}`);
+        broadcastRoomRoster();
+    } else {
+        broadcastToOpenPeers({
+            type: "username-update",
+            username: name
+        });
+    }
 
     renderUserList();
     setStatus(`Nickname set to "${name}"`);
@@ -1138,13 +1473,21 @@ function sendMessage() {
     const totalSet = new Set();
 
     if (activeTargets.length === 0) {
-        globalPendingQueue.push({ id: msgId, message: text, timestamp });
+        globalPendingQueue.push({
+            id: msgId,
+            message: text,
+            senderId: peer.id,
+            senderName: getUsername(),
+            timestamp
+        });
     } else {
         for (const entry of activeTargets) {
             totalSet.add(entry.id);
             entry.outbox.push({
                 id: msgId,
                 message: text,
+                senderId: peer.id,
+                senderName: getUsername(),
                 timestamp,
                 sent: false
             });
@@ -1175,12 +1518,14 @@ messageInput.addEventListener("keydown", event => {
 });
 
 // ==========================================
-// CONNECT BUTTON
+// CONNECT & NEW ROOM BUTTONS
 // ==========================================
 
 document.getElementById("connect").onclick = () => {
     connectToPlayer(remoteId.value);
 };
+
+document.getElementById("new-room").onclick = createNewRoom;
 
 // ==========================================
 // COPY PEER ID & INVITE LINK
@@ -1201,7 +1546,8 @@ document.getElementById("copy-id").onclick = async () => {
 document.getElementById("copy-invite").onclick = async () => {
     if (!peer || !peer.id) return;
 
-    const inviteUrl = `${getBaseUrl()}?join=${encodeURIComponent(peer.id)}`;
+    const targetId = isHost ? peer.id : (hostPeerId || peer.id);
+    const inviteUrl = `${getBaseUrl()}?join=${encodeURIComponent(targetId)}`;
     try {
         await navigator.clipboard.writeText(inviteUrl);
         setStatus("Invite link copied! Open it in another browser to join.");
@@ -1228,6 +1574,7 @@ window.addEventListener("beforeunload", () => {
 
     for (const entry of peers.values()) {
         clearReconnectTimer(entry);
+        clearConnectTimer(entry);
     }
 
     if (signalingRetryTimer) {
